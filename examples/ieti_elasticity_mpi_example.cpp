@@ -621,14 +621,14 @@ std::set<std::pair<int,int> > patchPairsLinkcell(const Problem& P, const Options
         h = std::min(h, ext / std::pow((double)P.mb[k].numElements(), 1.0/P.dim));
     }
     const double eps = 1e-3*h;
-    const lc_cell box = lcBox(pts, 10*h);
+    const lc_cell box = lcBox(pts, 2*h);
     const size_t n = pointPatch.size();
     size_t needOff = 0, needCols = 0;
     int pbc[3] = {0,0,0};
-    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 0.0, 1,
+    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 2*h, 1,
         NULL, 0, NULL, NULL, 0, &needOff, &needCols), "lc_pairs_within_csr query failed: " << lc_last_error());
     std::vector<int> off(needOff), cols(needCols);
-    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 0.0, 1,
+    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 2*h, 1,
         off.data(), needOff, cols.data(), NULL, needCols, &needOff, &needCols),
         "lc_pairs_within_csr failed: " << lc_last_error());
     std::set<std::pair<int,int> > result;
