@@ -881,7 +881,7 @@ private:
 /// output the size n + nc (x, then zero).
 class ConstrainedCg : public Op
 {
-    typedef gsEigen::LDLT<gsEigen::Matrix<real_t,gsEigen::Dynamic,gsEigen::Dynamic> > DenseLDLT;
+    typedef gsEigen::FullPivLU<gsEigen::Matrix<real_t,gsEigen::Dynamic,gsEigen::Dynamic> > DenseLDLT;
 public:
     ConstrainedCg(const SparseMatrix& A, const std::vector<SparseVector>& constraints,
                   OpPtr M, real_t tol, index_t maxit, memory::shared_ptr<InnerStats> st)
@@ -918,6 +918,14 @@ public:
         x.setZero(n, 1);
         if (z.norm() > 0)
             x = m_MCt * m_S.solve(z);
+        static int dbg = 0;
+        if (dbg < 3 && z.norm() > 0)
+        {
+            ++dbg;
+            gsInfo << "diagnostic particular solution: |C x - z| " << (Matrix(m_C * x) - z).norm()
+                   << ", |z| " << z.norm() << ", |x| " << x.norm() << ", rank of S " << m_S.rank()
+                   << " of " << nc << "\n";
+        }
         Matrix r = w - m_A * x;
         Matrix v;
         project(r, v);
