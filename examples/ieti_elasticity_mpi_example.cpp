@@ -970,8 +970,13 @@ private:
     void project(const Matrix& r, Matrix& v) const
     {
         m_M->apply(r, v);
-        Matrix t = m_S.solve(Matrix(m_C * v));
-        v -= m_MCt * t;
+        // A second pass removes the loss of feasibility by rounding that
+        // accumulates over the iterations with a single projection.
+        for (int pass=0; pass<2; ++pass)
+        {
+            Matrix t = m_S.solve(Matrix(m_C * v));
+            v -= m_MCt * t;
+        }
     }
     SparseMatrix m_A;
     SparseMatrix m_C;
