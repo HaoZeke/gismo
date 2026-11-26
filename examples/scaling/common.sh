@@ -1,22 +1,24 @@
 # Shared helpers for the IETI-DP elasticity scaling jobs. Sourced by the
 # job scripts; defines the problem sizes and the run function.
 #
-# Problem sizes (degree 4, 3 refinements per patch):
-#   unknowns = 3 * (nx*11+1) * (ny*11+1) * (nz*11+1) minus the clamped face;
-#   the strong problem 8x8x8 patches has about 2.1 million unknowns.
+# Problem sizes (degree 3, 3 refinements per patch, 10 basis functions per
+# patch and direction):
+#   unknowns = 3 * (nx*9+1) * (ny*9+1) * (nz*9+1) minus the clamped face;
+#   the strong problem of 8x8x8 patches has 1.57 million unknowns, the weak
+#   series has eight patches (about 24 thousand unknowns) per rank.
 
 # Executable and output directory are set by the job script.
 : "${EXE:?EXE is not set}"
 : "${OUTDIR:?OUTDIR is not set}"
 
-DEGREE=${DEGREE:-4}
+DEGREE=${DEGREE:-3}
 REFINE=${REFINE:-3}
 PRIMAL=${PRIMAL:-ve}
 TOL=${TOL:-1e-8}
 REPEATS=${REPEATS:-3}
 
 # Patch grids for the weak-scaling series: eight patches per rank
-# (about 30 thousand unknowns per rank at degree 4, 3 refinements).
+# (about 24 thousand unknowns per rank at degree 3, 3 refinements).
 weak_grid() {
   case "$1" in
     1)    echo 2,2,2 ;;
@@ -34,10 +36,11 @@ weak_grid() {
   esac
 }
 
-# One run: run_case TAG RANKS GRID. OMP_NUM_THREADS=1 and one rank per core.
+# One run: run_case TAG RANKS GRID [REPEATS]. OMP_NUM_THREADS=1 and one rank
+# per core.
 run_case() {
-  local tag=$1 ranks=$2 grid=$3 rep
-  for rep in $(seq 1 "$REPEATS"); do
+  local tag=$1 ranks=$2 grid=$3 reps=${4:-$REPEATS} rep
+  for rep in $(seq 1 "$reps"); do
     srun --ntasks="$ranks" --cpus-per-task=1 --cpu-bind=cores --distribution=block:block \
       "$EXE" --quiet --patches "$grid" --degree "$DEGREE" --refine "$REFINE" \
       --primal "$PRIMAL" --tol "$TOL" --partition morton --tag "${tag}_rep${rep}" \

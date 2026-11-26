@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ieti-weak-2n
-#SBATCH --time=TIME_W2
+#SBATCH --time=01:00:00
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=192
 #SBATCH --cpus-per-task=1

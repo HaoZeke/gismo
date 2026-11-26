@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ieti-strong-4n
-#SBATCH --time=TIME_S4
+#SBATCH --time=01:00:00
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=128
 #SBATCH --cpus-per-task=1

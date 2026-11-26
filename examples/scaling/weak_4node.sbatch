@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ieti-weak-4n
-#SBATCH --time=TIME_W4
+#SBATCH --time=01:00:00
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=192
 #SBATCH --cpus-per-task=1

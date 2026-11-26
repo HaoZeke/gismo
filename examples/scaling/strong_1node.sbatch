@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ieti-strong-1n
-#SBATCH --time=TIME_S1
+#SBATCH --time=09:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=192
 #SBATCH --cpus-per-task=1
@@ -32,8 +32,12 @@ export EXE OUTDIR
 
 source "$SLURM_SUBMIT_DIR/common.sh"
 
-# Strong scaling on one node: 512 patches (8x8x8), degree 4, 3 refinements,
-# about 2.1 million unknowns, ranks 1, 2, 4, ..., 128, 192.
-for R in 1 2 4 8 16 32 64 128 192; do
-  run_case "strong_n1_r${R}" "$R" 8,8,8
+# Strong scaling on one node: 512 patches (8x8x8), degree 3, 3 refinements,
+# 1.57 million unknowns, ranks 1, 2, 4, ..., 128, 192.
+# The serial time of the 1-rank run is the longest; single repeats up to 8
+# ranks (override the list with RANKS="16 32 ...").
+RANKS=${RANKS:-"1 2 4 8 16 32 64 128 192"}
+for R in $RANKS; do
+  if [ "$R" -le 8 ]; then reps=1; else reps=$REPEATS; fi
+  run_case "strong_n1_r${R}" "$R" 8,8,8 "$reps"
 done
