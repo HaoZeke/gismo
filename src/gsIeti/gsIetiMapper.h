@@ -127,7 +127,7 @@ public:
     ///
     /// This function exposes the \ref dofMapperLocal and the \ref fixedPart to
     /// the space.
-    void initFeSpace( typename gsExprAssembler<T>::space u, index_t k )
+    void initFeSpace( typename gsExprAssembler<T>::space u, index_t k ) const
     {
         GISMO_ASSERT( m_status&1,
             "gsIetiMapper: The class has not been initialized." );
