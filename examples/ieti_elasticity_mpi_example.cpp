@@ -1131,6 +1131,15 @@ void IetiMpi::setup(Timers& t)
                     << ": the patch is not a box with interfaces on the sides of its skeleton.");
                 dirichletSolver = memory::make_shared(new InnerCg(blocks.A11, M, m_opt.innerTol,
                     m_opt.innerMaxIt, m_stats));
+                if (m_opt.check && q == 0 && m_par.rank == 0)
+                {
+                    Matrix b = Matrix::Random(blocks.A11.rows(), 1), xi, xe;
+                    dirichletSolver->apply(b, xi);
+                    makeSparseCholeskySolver(blocks.A11)->apply(b, xe);
+                    gsInfo << "diagnostic Dirichlet solve: relative residual "
+                           << (blocks.A11*xi - b).norm()/b.norm() << ", difference to the exact solve "
+                           << (xi-xe).norm()/xe.norm() << "\n";
+                }
             }
             else
                 dirichletSolver = makeSparseCholeskySolver(blocks.A11);
@@ -1161,6 +1170,29 @@ void IetiMpi::setup(Timers& t)
                 Matrix out;
                 p.solver->apply(in, out);
                 p.Psi.col(j) = out.topRows(p.n).col(0);
+            }
+            if (m_opt.check && q == 0 && m_par.rank == 0)
+            {
+                Matrix Cd;
+                Cd.setZero(nc, p.n);
+                for (index_t i=0; i<nc; ++i)
+                    for (SparseVector::InnerIterator it(raw.constraints[i]); it; ++it)
+                        Cd(i, it.row()) = it.value();
+                Matrix R = Cd * p.Psi;
+                for (index_t i=0; i<nc; ++i) R(i,i) -= 1.0;
+                SparseMatrix modA, em, embB;
+                Matrix rhsB;
+                gsPrimalSystem<>::incorporateConstraints(raw.constraints, false, raw.A, modA, em, embB, rhsB);
+                OpPtr lu = makeSparseLUSolver(modA);
+                Matrix w;
+                w.setZero(p.n+nc, 1);
+                w.topRows(p.n) = Matrix::Random(p.n, 1);
+                Matrix se, si;
+                lu->apply(w, se);
+                p.solver->apply(w, si);
+                gsInfo << "diagnostic constrained solve: |C Psi - I| " << R.norm()
+                       << ", difference to the exact solve " << (se.topRows(p.n)-si.topRows(p.n)).norm()/se.topRows(p.n).norm()
+                       << " (residual-free norm of the exact solution " << se.topRows(p.n).norm() << ")\n";
             }
         }
         else
