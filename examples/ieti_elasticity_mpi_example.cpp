@@ -336,8 +336,6 @@ void buildProblem(const Options& o, Problem& P)
         P.mapper[r].init(P.mb, u.mapper(), u.fixedPart());
     }
     for (index_t r=0; r<dim; ++r)
-        P.mapper[r].computeJumpMatrices(true, true);
-    for (index_t r=0; r<dim; ++r)
     {
         P.mapper[r].cornersAsPrimals();
         if (o.primal != "v")
@@ -348,9 +346,19 @@ void buildProblem(const Options& o, Problem& P)
     P.nLambda = P.nPrimal = P.nUnknowns = 0;
     for (index_t r=0; r<dim; ++r)
     {
-        P.nLambda   += P.mapper[r].nLagrangeMultipliers();
         P.nPrimal   += P.mapper[r].nPrimalDofs();
         P.nUnknowns += P.mapper[r].dofMapperGlobal().freeSize();
+    }
+}
+
+/// Jump matrices of the given patches (all patches if the list is empty)
+void buildJumps(Problem& P, const std::vector<index_t>& patches)
+{
+    P.nLambda = 0;
+    for (index_t r=0; r<P.dim; ++r)
+    {
+        P.mapper[r].computeJumpMatrices(true, true, patches);
+        P.nLambda += P.mapper[r].nLagrangeMultipliers();
     }
 }
 
@@ -585,7 +593,7 @@ std::vector<int> ownerLinkcell(const Problem& P, const Options& o, int parts)
     for (index_t k=0; k<P.nPatches; ++k)
     {
         index_t nk = 0;
-        for (index_t r=0; r<P.dim; ++r) nk += P.mapper[r].jumpMatrix(k).cols();
+        for (index_t r=0; r<P.dim; ++r) nk += P.mapper[r].dofMapperLocal(k).freeSize();
         weight[pointCell[k]] += (o.cost == "n2") ? (uint64_t)nk*(uint64_t)nk : (uint64_t)nk;
     }
     GISMO_ENSURE(0 == lc_partition_weights(nxyz, weight.data(), ncell, parts,
@@ -1195,6 +1203,11 @@ int main(int argc, char* argv[])
     const PartStats pst = partitionStats(P, owner, par.size);
     GISMO_ENSURE(pst.minPatches > 0, "Partition leaves a rank without patches.");
     std::vector<index_t> mine = distribute(owner, par.rank);
+    // The jump matrices of the foreign patches are not stored unless a check
+    // needs the serial reference.
+    t0 = wallTime();
+    buildJumps(P, (o.check || o.checkDirect) ? std::vector<index_t>() : mine);
+    tm.mapper += wallTime() - t0;
 
     IetiMpi ieti(P, par, o, mine);
     ieti.setup(tm);

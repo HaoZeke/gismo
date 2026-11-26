@@ -294,7 +294,8 @@ std::vector<index_t> gsIetiMapper<T>::skeletonDofs( const index_t patch ) const
 }
 
 template <class T>
-void gsIetiMapper<T>::computeJumpMatrices( bool fullyRedundant, bool excludeCorners )
+void gsIetiMapper<T>::computeJumpMatrices( bool fullyRedundant, bool excludeCorners,
+    const std::vector<index_t>& patches )
 {
     GISMO_ASSERT( m_status&1, "gsIetiMapper: The class has not been initialized." );
 
@@ -358,11 +359,16 @@ void gsIetiMapper<T>::computeJumpMatrices( bool fullyRedundant, bool excludeCorn
     }
 
     // Compute the jump matrices
+    std::vector<char> keep(nPatches, patches.empty() ? 1 : 0);
+    for (size_t i=0; i<patches.size(); ++i)
+        keep[patches[i]] = 1;
+    m_nLagrangeMultipliers = numLagrangeMult;
     std::vector< gsSparseEntries<T> > jumpMatrices_se(nPatches);
     for (index_t i=0; i<nPatches; ++i)
     {
         const index_t dim = m_multiBasis->dim();
-        jumpMatrices_se[i].reserve(std::pow(m_dofMapperLocal[i].freeSize(),(1.0-dim)/dim));
+        if (keep[i])
+            jumpMatrices_se[i].reserve(std::pow(m_dofMapperLocal[i].freeSize(),(1.0-dim)/dim));
     }
 
     index_t multiplier = 0;
@@ -378,8 +384,10 @@ void gsIetiMapper<T>::computeJumpMatrices( bool fullyRedundant, bool excludeCorn
             {
                 const index_t patch2 = coupling[i][j2].first;
                 const index_t localMappedIndex2 = coupling[i][j2].second;
-                jumpMatrices_se[patch1].add(multiplier,localMappedIndex1,(T)1);
-                jumpMatrices_se[patch2].add(multiplier,localMappedIndex2,(T)-1);
+                if (keep[patch1])
+                    jumpMatrices_se[patch1].add(multiplier,localMappedIndex1,(T)1);
+                if (keep[patch2])
+                    jumpMatrices_se[patch2].add(multiplier,localMappedIndex2,(T)-1);
                 ++multiplier;
             }
         }
@@ -390,8 +398,13 @@ void gsIetiMapper<T>::computeJumpMatrices( bool fullyRedundant, bool excludeCorn
     m_jumpMatrices.clear();
     for (index_t i=0; i<nPatches; ++i)
     {
-        m_jumpMatrices.push_back(JumpMatrix(numLagrangeMult, m_dofMapperLocal[i].freeSize()));
-        m_jumpMatrices[i].setFrom(jumpMatrices_se[i]);
+        if (keep[i])
+        {
+            m_jumpMatrices.push_back(JumpMatrix(numLagrangeMult, m_dofMapperLocal[i].freeSize()));
+            m_jumpMatrices[i].setFrom(jumpMatrices_se[i]);
+        }
+        else
+            m_jumpMatrices.push_back(JumpMatrix(0, m_dofMapperLocal[i].freeSize()));
     }
 
 }
