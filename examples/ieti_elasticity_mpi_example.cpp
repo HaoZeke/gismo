@@ -818,7 +818,8 @@ std::vector<gsBoundaryConditions<> > sidesAsBc(const Problem& P, const std::vect
     std::vector<gsBoundaryConditions<> > bc(P.dim);
     for (index_t r=0; r<P.dim; ++r)
         for (size_t i=0; i<sides.size(); ++i)
-            bc[r].addCondition(patchSide(0, boxSide(sides[i])), condition_type::dirichlet, &P.zero);
+            bc[r].addCondition(patchSide(0, boxSide(sides[i])), condition_type::dirichlet,
+                               const_cast<gsConstantFunction<>*>(&P.zero));
     return bc;
 }
 
