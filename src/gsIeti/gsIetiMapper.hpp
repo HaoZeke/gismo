@@ -215,7 +215,8 @@ gsSparseVector<T> gsIetiMapper<T>::assembleAverage(
 
 
 template <class T>
-void gsIetiMapper<T>::interfaceAveragesAsPrimals( const gsMultiPatch<T>& geo, const short_t d )
+void gsIetiMapper<T>::interfaceAveragesAsPrimals( const gsMultiPatch<T>& geo, const short_t d,
+    const std::vector<index_t>& patches )
 {
     GISMO_ASSERT( m_status&1, "gsIetiMapper: The class has not been initialized." );
     GISMO_ASSERT( d>0, "gsIetiMapper::interfaceAveragesAsPrimals cannot handle corners." );
@@ -231,6 +232,10 @@ void gsIetiMapper<T>::interfaceAveragesAsPrimals( const gsMultiPatch<T>& geo, co
         " already been called for d="<<d );
     m_status |= flag;
 
+    std::vector<char> keep(m_multiBasis->nBases(), patches.empty() ? 1 : 0);
+    for (size_t i=0; i<patches.size(); ++i)
+        keep[patches[i]] = 1;
+
     std::vector< std::vector<patchComponent> > components = geo.allComponents();
     const index_t nComponents = components.size();
     for (index_t n=0; n<nComponents; ++n)
@@ -242,6 +247,19 @@ void gsIetiMapper<T>::interfaceAveragesAsPrimals( const gsMultiPatch<T>& geo, co
             for (index_t i=0; i<sz; ++i)
             {
                 const index_t k = components[n][i].patch();
+                if (!keep[k])
+                {
+                    // The average is nonzero iff the component has a free dof
+                    gsMatrix<index_t> indices;
+                    (*m_multiBasis)[k].componentBasis_withIndices(components[n][i], indices, false);
+                    for (index_t j=0; j<indices.size(); ++j)
+                        if (m_dofMapperLocal[k].is_free_index(m_dofMapperLocal[k].index(indices(j,0),0)))
+                        {
+                            ++used;
+                            break;
+                        }
+                    continue;
+                }
                 gsSparseVector<T> constr = assembleAverage(
                     geo[k],
                     (*m_multiBasis)[k],

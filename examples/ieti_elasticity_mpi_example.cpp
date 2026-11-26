@@ -335,20 +335,27 @@ void buildProblem(const Options& o, Problem& P)
         u.setup(P.bc[r], dirichlet::interpolation, 0);
         P.mapper[r].init(P.mb, u.mapper(), u.fixedPart());
     }
+    P.nLambda = P.nPrimal = P.nUnknowns = 0;
+    for (index_t r=0; r<dim; ++r)
+        P.nUnknowns += P.mapper[r].dofMapperGlobal().freeSize();
+}
+
+/// Primal constraints; averages are assembled for the given patches only
+/// (all patches if the list is empty)
+void buildPrimals(Problem& P, const Options& o, const std::vector<index_t>& patches)
+{
+    const index_t dim = P.dim;
     for (index_t r=0; r<dim; ++r)
     {
         P.mapper[r].cornersAsPrimals();
         if (o.primal != "v")
-            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 1);
+            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 1, patches);
         if (o.primal == "vef" && dim==3)
-            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 2);
+            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 2, patches);
     }
-    P.nLambda = P.nPrimal = P.nUnknowns = 0;
+    P.nPrimal = 0;
     for (index_t r=0; r<dim; ++r)
-    {
-        P.nPrimal   += P.mapper[r].nPrimalDofs();
-        P.nUnknowns += P.mapper[r].dofMapperGlobal().freeSize();
-    }
+        P.nPrimal += P.mapper[r].nPrimalDofs();
 }
 
 /// Jump matrices of the given patches (all patches if the list is empty)
@@ -1206,7 +1213,9 @@ int main(int argc, char* argv[])
     // The jump matrices of the foreign patches are not stored unless a check
     // needs the serial reference.
     t0 = wallTime();
-    buildJumps(P, (o.check || o.checkDirect) ? std::vector<index_t>() : mine);
+    const std::vector<index_t> subset = (o.check || o.checkDirect) ? std::vector<index_t>() : mine;
+    buildPrimals(P, o, subset);
+    buildJumps(P, subset);
     tm.mapper += wallTime() - t0;
 
     IetiMpi ieti(P, par, o, mine);

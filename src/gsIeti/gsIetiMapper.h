@@ -97,7 +97,12 @@ public:
     /// patch averages. In this case, the requirement that it contributes to
     /// at least two patches does not apply. For corners, use \ref cornersAsPrimals
     /// instead.
-    void interfaceAveragesAsPrimals( const gsMultiPatch<T>& geo, short_t d );
+    ///
+    /// If \a patches is not empty, the constraint vectors are only assembled
+    /// for these patches. The numbering of the primal dofs is the same as
+    /// without the list, so that distributed solvers agree on it.
+    void interfaceAveragesAsPrimals( const gsMultiPatch<T>& geo, short_t d,
+                                     const std::vector<index_t>& patches = std::vector<index_t>() );
 
     /// @brief With this function, the caller can register more primal constraints
     ///
