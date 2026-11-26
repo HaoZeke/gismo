@@ -946,6 +946,18 @@ public:
                 p = v + (rzn/rz) * p;
                 rz = rzn;
             }
+        static int dbg2 = 0;
+        if (dbg2 < 2 && z.norm() > 0)
+        {
+            ++dbg2;
+            Matrix Cd;
+            Cd.setZero(nc, n);
+            for (index_t k2=0; k2<m_C.outerSize(); ++k2)
+                for (SparseMatrix::InnerIterator it2(m_C, k2); it2; ++it2)
+                    Cd(it2.row(), it2.col()) = it2.value();
+            gsInfo << "diagnostic constrained CG end: iterations " << it << ", |C x - z| " << (Cd*x - z).norm()
+                   << ", |x| " << x.norm() << ", rz0 " << rz0 << ", rz " << rz << ", |C| " << Cd.norm() << "\n";
+        }
         m_st->conCalls += 1;
         m_st->conIters += it;
         out.setZero(n+nc, 1);
@@ -1129,7 +1141,8 @@ void IetiMpi::setup(Timers& t)
         p.n = raw.A.rows();
         p.f = raw.f;
 
-        const bool inexact = (m_opt.localSolver == "fastdiag");
+        const bool inexactD = (m_opt.localSolver == "fastdiag" || m_opt.localSolver == "fastdiag-dirichlet");
+        const bool inexact  = (m_opt.localSolver == "fastdiag");
         const index_t nc = raw.constraints.size();
 
         // Scaled Dirichlet preconditioner: Schur complement on the skeleton
@@ -1137,7 +1150,7 @@ void IetiMpi::setup(Timers& t)
             gsScaledDirichletPrec<>::Blocks blocks =
                 gsScaledDirichletPrec<>::matrixBlocks(raw.A, raw.skeleton);
             OpPtr dirichletSolver;
-            if (inexact)
+            if (inexactD)
             {
                 OpPtr M = makeDirichletFd(m_P, k);
                 GISMO_ENSURE(M->rows() == blocks.A11.rows(), "Fast diagonalization of patch " << k
@@ -1478,7 +1491,7 @@ int main(int argc, char* argv[])
     cmd.addString("",  "traction",  "Traction vector on the face of maximal x", o.traction);
     cmd.addString("",  "primal",    "Primal space: v (vertices), ve (+ edge averages), vef (+ face averages)", o.primal);
     cmd.addSwitch("",  "eliminate-vertices", "Eliminate vertex constraints in the local systems", o.eliminateVertices);
-    cmd.addString("",  "local-solver", "Local solver: lu, ldlt (ldlt only with --eliminate-vertices and primal v) or fastdiag (inexact, inner CG preconditioned by fast diagonalization; box patches only)", o.localSolver);
+    cmd.addString("",  "local-solver", "Local solver: lu, ldlt (ldlt only with --eliminate-vertices and primal v) fastdiag-dirichlet (inner CG preconditioned by fast diagonalization for the Dirichlet solves of the preconditioner, exact constrained solves) or fastdiag (inexact Dirichlet and constrained solves; box patches only)", o.localSolver);
     cmd.addReal  ("",  "inner-tol", "Relative tolerance of the inner CG of --local-solver=fastdiag", o.innerTol);
     cmd.addInt   ("",  "inner-maxit", "Maximum number of inner CG iterations", o.innerMaxIt);
     cmd.addString("",  "partition", "Patch distribution: lex, morton or linkcell (needs GISMO_WITH_LINKCELL)", o.partition);
@@ -1506,7 +1519,7 @@ int main(int argc, char* argv[])
     tm.mapper = wallTime() - t0;
 
     GISMO_ENSURE(par.size <= P.nPatches, "More ranks than patches.");
-    if (o.localSolver == "fastdiag")
+    if (o.localSolver == "fastdiag" || o.localSolver == "fastdiag-dirichlet")
     {
         GISMO_ENSURE(!o.eliminateVertices, "--local-solver=fastdiag does not eliminate vertices.");
         // The inexact operator differs from the exact one by the inner tolerance.
