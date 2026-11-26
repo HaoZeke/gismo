@@ -46,10 +46,15 @@
 #include <chrono>
 #include <cmath>
 #include <numeric>
+#include <set>
 #include <sstream>
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#ifdef IETI_WITH_LINKCELL
+#include <linkcell.h>
 #endif
 
 #if defined(__has_include)
@@ -91,7 +96,7 @@ struct Par
     double commBytes;
 #ifdef GISMO_WITH_MPI
     MPI_Comm comm;
-    explicit Par(MPI_Comm c) : comm(c), commTime(0), commCalls(0), commBytes(0)
+    explicit Par(MPI_Comm c) : commTime(0), commCalls(0), commBytes(0), comm(c)
     { MPI_Comm_rank(c,&rank); MPI_Comm_size(c,&size); }
 
     void sum(Matrix& m)
@@ -170,7 +175,9 @@ struct Options
     std::string partition;     // lex, morton
     real_t  tol;
     index_t maxIt;
-    bool    check, checkDirect, fastDiag, quiet;
+    bool    check, checkDirect, checkTopology, fastDiag, quiet;
+    std::string cost;          // n or n2 (patch weight of the linkcell partition)
+    index_t lcMethod;          // linkcell partition method
     std::string tag;
     real_t  gateMult, gateL2, gateComp, gateDirectL2, gateDirectComp;
 };
@@ -361,13 +368,6 @@ struct Raw
     std::vector<index_t>      primalIdx;
 };
 
-index_t localSize(const Problem& P, index_t k)
-{
-    index_t n = 0;
-    for (index_t r=0; r<P.dim; ++r) n += P.mapper[r].jumpMatrix(k).cols();
-    return n;
-}
-
 void assembleRaw(const Problem& P, index_t k, Raw& out)
 {
     const index_t dim = P.dim;
@@ -516,12 +516,181 @@ unsigned long mortonKey(unsigned long x, unsigned long y, unsigned long z)
     return key;
 }
 
-std::vector<index_t> distribute(const Problem& P, const std::string& scheme, int rank, int size)
+#ifdef IETI_WITH_LINKCELL
+/// Patch centroids, in physical space (z = 0 in 2D)
+std::vector<double> patchCentroids(const Problem& P)
+{
+    std::vector<double> xyz(3*P.nPatches, 0.0);
+    for (index_t k=0; k<P.nPatches; ++k)
+    {
+        gsMatrix<> supp = P.mp[k].support();
+        gsMatrix<> pt(P.mp.parDim(),1), x;
+        for (index_t i=0; i<P.mp.parDim(); ++i) pt(i,0) = 0.5*(supp(i,0)+supp(i,1));
+        P.mp[k].eval_into(pt, x);
+        for (index_t i=0; i<x.rows(); ++i) xyz[3*k+i] = x(i,0);
+    }
+    return xyz;
+}
+
+/// Box that contains all points with a margin; the margin exceeds every
+/// cutoff used, so that periodic images never produce pairs.
+lc_cell lcBox(const std::vector<double>& xyz, double margin)
+{
+    double lo[3] = {1e300,1e300,1e300}, hi[3] = {-1e300,-1e300,-1e300};
+    for (size_t i=0; i<xyz.size()/3; ++i)
+        for (int d=0; d<3; ++d)
+        {
+            lo[d] = std::min(lo[d], xyz[3*i+d]);
+            hi[d] = std::max(hi[d], xyz[3*i+d]);
+        }
+    lc_cell c;
+    c.ax = hi[0]-lo[0]+4*margin; c.ay = 0; c.az = 0;
+    c.bx = 0; c.by = hi[1]-lo[1]+4*margin; c.bz = 0;
+    c.cx = 0; c.cy = 0; c.cz = hi[2]-lo[2]+4*margin;
+    c.ox = lo[0]-2*margin; c.oy = lo[1]-2*margin; c.oz = lo[2]-2*margin;
+    return c;
+}
+
+/// Largest patch extent
+double patchExtent(const Problem& P)
+{
+    double e = 0;
+    for (index_t k=0; k<P.nPatches; ++k)
+        for (index_t d=0; d<P.dim; ++d)
+            e = std::max(e, (double)(P.mp[k].coefs().col(d).maxCoeff() - P.mp[k].coefs().col(d).minCoeff()));
+    return e;
+}
+
+/// Rank of every patch from linkcell: the patch centroids are binned with
+/// cells of one patch extent, every cell carries the summed cost of its
+/// patches and the cells are cut into compact parts.
+std::vector<int> ownerLinkcell(const Problem& P, const Options& o, int parts)
+{
+    const std::vector<double> xyz = patchCentroids(P);
+    const double ext = patchExtent(P);
+    const lc_cell box = lcBox(xyz, 2*ext);
+    const double cutoff = 1.5*ext;
+    const size_t n = P.nPatches;
+    size_t ncell = 0;
+    int nxyz[3];
+    double width[3];
+    GISMO_ENSURE(0 == lc_mesh_cut(xyz.data(), n, &box, cutoff, NULL, ext, parts,
+        (uint8_t)o.lcMethod, 0.0, 0, nxyz, width, NULL, NULL, 0, 0, &ncell),
+        "lc_mesh_cut query failed: " << lc_last_error());
+    std::vector<int> domain(ncell), pointCell(n);
+    GISMO_ENSURE(0 == lc_mesh_cut(xyz.data(), n, &box, cutoff, NULL, ext, parts,
+        (uint8_t)o.lcMethod, 0.0, 0, nxyz, width, domain.data(), pointCell.data(), ncell, n, &ncell),
+        "lc_mesh_cut failed: " << lc_last_error());
+    std::vector<uint64_t> weight(ncell, 0);
+    for (index_t k=0; k<P.nPatches; ++k)
+    {
+        index_t nk = 0;
+        for (index_t r=0; r<P.dim; ++r) nk += P.mapper[r].jumpMatrix(k).cols();
+        weight[pointCell[k]] += (o.cost == "n2") ? (uint64_t)nk*(uint64_t)nk : (uint64_t)nk;
+    }
+    GISMO_ENSURE(0 == lc_partition_weights(nxyz, weight.data(), ncell, parts,
+        (uint8_t)o.lcMethod, 0.0, domain.data()), "lc_partition_weights failed: " << lc_last_error());
+    std::vector<int> owner(n);
+    for (size_t k=0; k<n; ++k) owner[k] = domain[pointCell[k]];
+    return owner;
+}
+
+/// Pairs of patches that own coincident interface dofs, found with
+/// lc_pairs_within_csr on the physical images of the Greville points of all
+/// coupled dofs. The cutoff is a small fraction of the element size.
+std::set<std::pair<int,int> > patchPairsLinkcell(const Problem& P, const Options& o, size_t& nDofPairs)
+{
+    std::vector<double> pts;
+    std::vector<int> pointPatch;
+    const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
+    double h = 1e300;
+    for (index_t k=0; k<P.nPatches; ++k)
+    {
+        gsMatrix<> anc = P.mb[k].anchors();
+        gsMatrix<> x;
+        P.mp[k].eval_into(anc, x);
+        for (index_t i=0; i<anc.cols(); ++i)
+            if (dm.is_coupled(i,k))
+            {
+                for (index_t d=0; d<3; ++d) pts.push_back(d<x.rows() ? x(d,i) : 0.0);
+                pointPatch.push_back((int)k);
+            }
+        double ext = 1e300;
+        for (index_t d=0; d<P.dim; ++d)
+            ext = std::min(ext, (double)(P.mp[k].coefs().col(d).maxCoeff() - P.mp[k].coefs().col(d).minCoeff()));
+        h = std::min(h, ext / std::pow((double)P.mb[k].numElements(), 1.0/P.dim));
+    }
+    const double eps = 1e-3*h;
+    const lc_cell box = lcBox(pts, 10*h);
+    const size_t n = pointPatch.size();
+    size_t needOff = 0, needCols = 0;
+    int pbc[3] = {0,0,0};
+    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 0.0, 1,
+        NULL, 0, NULL, NULL, 0, &needOff, &needCols), "lc_pairs_within_csr query failed: " << lc_last_error());
+    std::vector<int> off(needOff), cols(needCols);
+    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 0.0, 1,
+        off.data(), needOff, cols.data(), NULL, needCols, &needOff, &needCols),
+        "lc_pairs_within_csr failed: " << lc_last_error());
+    std::set<std::pair<int,int> > result;
+    nDofPairs = needCols;
+    for (size_t i=0; i<n; ++i)
+        for (int c=off[i]; c<off[i+1]; ++c)
+        {
+            int a = pointPatch[i], b = pointPatch[cols[c]];
+            if (a != b) result.insert(std::make_pair(std::min(a,b), std::max(a,b)));
+        }
+    GISMO_UNUSED(o);
+    return result;
+}
+#endif
+
+/// Patch pairs that share a coupled dof, from the global dof mapper
+std::set<std::pair<int,int> > patchPairsMapper(const Problem& P)
+{
+    const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
+    std::vector<std::vector<int> > groups(dm.coupledSize());
+    for (index_t k=0; k<P.nPatches; ++k)
+        for (index_t i=0; i<dm.patchSize(k); ++i)
+            if (dm.is_coupled(i,k)) groups[dm.cindex(i,k)].push_back((int)k);
+    std::set<std::pair<int,int> > result;
+    for (size_t g=0; g<groups.size(); ++g)
+        for (size_t a=0; a<groups[g].size(); ++a)
+            for (size_t b=a+1; b<groups[g].size(); ++b)
+                result.insert(std::make_pair(std::min(groups[g][a],groups[g][b]),
+                                             std::max(groups[g][a],groups[g][b])));
+    return result;
+}
+
+/// Patch pairs that share a face (or edge in 2D): the interfaces of
+/// gsMultiPatch::computeTopology
+std::set<std::pair<int,int> > patchPairsTopology(const Problem& P)
+{
+    std::set<std::pair<int,int> > result;
+    for (gsMultiPatch<>::const_iiterator it = P.mp.iBegin(); it != P.mp.iEnd(); ++it)
+    {
+        const int a = it->first().patch, b = it->second().patch;
+        result.insert(std::make_pair(std::min(a,b), std::max(a,b)));
+    }
+    return result;
+}
+
+/// Rank of every patch
+std::vector<int> ownerOf(const Problem& P, const Options& o, int size)
 {
     const index_t N = P.nPatches;
+    std::vector<int> owner(N, 0);
+    if (o.partition == "linkcell")
+    {
+#ifdef IETI_WITH_LINKCELL
+        if (size > 1) return ownerLinkcell(P, o, size);
+        return owner;
+#else
+        GISMO_ERROR("--partition=linkcell needs a build with GISMO_WITH_LINKCELL.");
+#endif
+    }
     std::vector<index_t> order(N);
     std::iota(order.begin(), order.end(), 0);
-    if (scheme == "morton" && P.grid[0] > 0)
+    if (o.partition == "morton" && P.grid[0] > 0)
     {
         std::vector<std::pair<unsigned long,index_t> > key(N);
         for (index_t q=0; q<N; ++q)
@@ -534,9 +703,61 @@ std::vector<index_t> distribute(const Problem& P, const std::string& scheme, int
         std::sort(key.begin(), key.end());
         for (index_t q=0; q<N; ++q) order[q] = key[q].second;
     }
-    const index_t lo = (index_t)(((long long)rank*N)/size);
-    const index_t hi = (index_t)(((long long)(rank+1)*N)/size);
-    return std::vector<index_t>(order.begin()+lo, order.begin()+hi);
+    for (int r=0; r<size; ++r)
+    {
+        const index_t lo = (index_t)(((long long)r*N)/size);
+        const index_t hi = (index_t)(((long long)(r+1)*N)/size);
+        for (index_t q=lo; q<hi; ++q) owner[order[q]] = r;
+    }
+    return owner;
+}
+
+struct PartStats { index_t cutDofs, nbrMax; double nbrAvg; index_t minPatches, maxPatches; };
+
+/// Interface size between ranks: coupled dof groups that touch more than one
+/// rank, and the number of neighbouring ranks of each rank
+PartStats partitionStats(const Problem& P, const std::vector<int>& owner, int size)
+{
+    const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
+    std::vector<std::vector<int> > groups(dm.coupledSize());
+    for (index_t k=0; k<P.nPatches; ++k)
+        for (index_t i=0; i<dm.patchSize(k); ++i)
+            if (dm.is_coupled(i,k)) groups[dm.cindex(i,k)].push_back(owner[k]);
+    PartStats st;
+    st.cutDofs = 0;
+    std::vector<std::set<int> > nbr(size);
+    for (size_t g=0; g<groups.size(); ++g)
+    {
+        std::set<int> rk(groups[g].begin(), groups[g].end());
+        if (rk.size() > 1)
+        {
+            st.cutDofs += rk.size()-1;
+            for (std::set<int>::const_iterator a=rk.begin(); a!=rk.end(); ++a)
+                for (std::set<int>::const_iterator b=rk.begin(); b!=rk.end(); ++b)
+                    if (*a != *b) nbr[*a].insert(*b);
+        }
+    }
+    st.cutDofs *= P.dim;
+    st.nbrMax = 0; st.nbrAvg = 0;
+    std::vector<index_t> cnt(size, 0);
+    for (size_t k=0; k<owner.size(); ++k) cnt[owner[k]]++;
+    st.minPatches = *std::min_element(cnt.begin(), cnt.end());
+    st.maxPatches = *std::max_element(cnt.begin(), cnt.end());
+    for (int r=0; r<size; ++r)
+    {
+        st.nbrMax = std::max<index_t>(st.nbrMax, nbr[r].size());
+        st.nbrAvg += nbr[r].size();
+    }
+    st.nbrAvg /= size;
+    return st;
+}
+
+std::vector<index_t> distribute(const std::vector<int>& owner, int rank)
+{
+    std::vector<index_t> mine;
+    for (size_t k=0; k<owner.size(); ++k)
+        if (owner[k] == rank) mine.push_back((index_t)k);
+    return mine;
 }
 
 //---------------------------------------------------------------------------
@@ -922,7 +1143,8 @@ int main(int argc, char* argv[])
     o.primal = "ve"; o.eliminateVertices = false;
     o.localSolver = "lu"; o.partition = "lex";
     o.tol = 1e-12; o.maxIt = 500;
-    o.check = o.checkDirect = o.fastDiag = o.quiet = false;
+    o.check = o.checkDirect = o.checkTopology = o.fastDiag = o.quiet = false;
+    o.cost = "n2"; o.lcMethod = 1;
     o.gateMult = 1e-10; o.gateL2 = 1e-8; o.gateComp = 1e-8;
     o.gateDirectL2 = 1e-8; o.gateDirectComp = 1e-8;
 
@@ -938,7 +1160,10 @@ int main(int argc, char* argv[])
     cmd.addString("",  "primal",    "Primal space: v (vertices), ve (+ edge averages), vef (+ face averages)", o.primal);
     cmd.addSwitch("",  "eliminate-vertices", "Eliminate vertex constraints in the local systems", o.eliminateVertices);
     cmd.addString("",  "local-solver", "Local solver: lu or ldlt (ldlt only with --eliminate-vertices and primal v)", o.localSolver);
-    cmd.addString("",  "partition", "Patch distribution: lex or morton", o.partition);
+    cmd.addString("",  "partition", "Patch distribution: lex, morton or linkcell (needs GISMO_WITH_LINKCELL)", o.partition);
+    cmd.addString("",  "cost",      "Patch weight of the linkcell partition: n (unknowns) or n2 (squared)", o.cost);
+    cmd.addInt   ("",  "lc-method", "linkcell partition method (1 Hilbert, 3 Hilbert + Fiduccia-Mattheyses)", o.lcMethod);
+    cmd.addSwitch("",  "check-topology", "Compare the interfaces found by linkcell with gsMultiPatch::computeTopology", o.checkTopology);
     cmd.addReal  ("t", "tol",       "Relative residual tolerance of the CG solver", o.tol);
     cmd.addInt   ("",  "maxit",     "Maximum number of CG iterations", o.maxIt);
     cmd.addSwitch("",  "check",     "Compare with the serial IETI-DP of the library classes", o.check);
@@ -964,7 +1189,12 @@ int main(int argc, char* argv[])
         GISMO_ENSURE(o.eliminateVertices && o.primal == "v",
                      "--local-solver=ldlt requires --eliminate-vertices and --primal=v.");
 
-    std::vector<index_t> mine = distribute(P, o.partition, par.rank, par.size);
+    double tPart0 = wallTime();
+    const std::vector<int> owner = ownerOf(P, o, par.size);
+    const double tPartition = wallTime() - tPart0;
+    const PartStats pst = partitionStats(P, owner, par.size);
+    GISMO_ENSURE(pst.minPatches > 0, "Partition leaves a rank without patches.");
+    std::vector<index_t> mine = distribute(owner, par.rank);
 
     IetiMpi ieti(P, par, o, mine);
     ieti.setup(tm);
@@ -1057,7 +1287,7 @@ int main(int argc, char* argv[])
 #ifdef IETI_HAVE_ELASTICITY
     if (o.checkDirect)
     {
-        gsConstantFunction<> body(0.0, dim);
+        gsConstantFunction<> body(gsVector<>::Zero(dim), dim);
         std::vector<real_t> tr = P.traction;
         gsConstantFunction<> g(gsVector<>::Map(tr.data(), dim), dim);
         gsBoundaryConditions<> bcInfo;
@@ -1098,6 +1328,29 @@ int main(int argc, char* argv[])
     { status = 1; failures += " direct-check-unavailable"; }
 #endif
 
+    // Topology cross-check
+    index_t lcPairs = -1;
+    std::string topo = "NA";
+    if (o.checkTopology)
+    {
+        const std::set<std::pair<int,int> > viaMapper = patchPairsMapper(P);
+        const std::set<std::pair<int,int> > viaTopo   = patchPairsTopology(P);
+        bool ok = std::includes(viaMapper.begin(), viaMapper.end(), viaTopo.begin(), viaTopo.end());
+#ifdef IETI_WITH_LINKCELL
+        size_t nDofPairs = 0;
+        const std::set<std::pair<int,int> > viaLc = patchPairsLinkcell(P, o, nDofPairs);
+        lcPairs = (index_t)viaLc.size();
+        ok = ok && (viaLc == viaMapper);
+        if (par.rank == 0)
+            gsInfo << "topology: patch pairs linkcell=" << viaLc.size() << " dof-mapper=" << viaMapper.size()
+                   << " computeTopology(faces)=" << viaTopo.size() << " coincident-dof-pairs=" << nDofPairs << "\n";
+        topo = ok ? "PASS" : "FAIL";
+#else
+        topo = ok ? "PASS-noLinkcell" : "FAIL";
+#endif
+        if (!ok) { status = 1; failures += " topology"; }
+    }
+
     tm.total = wallTime() - tStart;
 
     // Timers: maximum over the ranks
@@ -1130,6 +1383,14 @@ int main(int argc, char* argv[])
            << " primal=" << P.nPrimal
            << " primal_type=" << o.primal
            << " partition=" << o.partition
+           << " t_partition=" << tPartition
+           << " cut_dofs=" << pst.cutDofs
+           << " nbr_max=" << pst.nbrMax
+           << " nbr_avg=" << pst.nbrAvg
+           << " patches_min=" << pst.minPatches
+           << " patches_max=" << pst.maxPatches
+           << " lc_pairs=" << lcPairs
+           << " topology=" << topo
            << " t_mapper=" << tMapper
            << " t_assembly=" << tAssembly
            << " t_factor=" << tFactor
