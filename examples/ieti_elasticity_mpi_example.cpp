@@ -1184,6 +1184,15 @@ void IetiMpi::setup(Timers& t)
                 for (index_t i=0; i<nc; ++i)
                     for (SparseVector::InnerIterator it(raw.constraints[i]); it; ++it)
                         Cd(i, it.row()) = it.value();
+                {
+                    OpPtr Mn = makeNeumannFd(m_P, k);
+                    Matrix x1 = Matrix::Random(Mn->cols(), 1), y1 = Matrix::Random(Mn->cols(), 1), Mx, My;
+                    Mn->apply(x1, Mx);
+                    Mn->apply(y1, My);
+                    gsInfo << "diagnostic Neumann fast diagonalization: size " << Mn->rows() << " (local " << p.n
+                           << "), y'Mx " << y1.col(0).dot(Mx.col(0)) << " x'My " << x1.col(0).dot(My.col(0))
+                           << ", x'Mx " << x1.col(0).dot(Mx.col(0)) << "\n";
+                }
                 Matrix R = Cd * p.Psi;
                 for (index_t i=0; i<nc; ++i) R(i,i) -= 1.0;
                 SparseMatrix modA, em, embB;
