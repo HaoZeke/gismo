@@ -47,6 +47,22 @@ foreach(file ${FILES})
   install(TARGETS ${tarname} DESTINATION "${BIN_INSTALL_DIR}" COMPONENT exe OPTIONAL)
 endforeach(file ${FILES})
 
+# Optional linked-cell library (C ABI of linkcell) for the patch distribution
+# and the interface detection of ieti_elasticity_mpi_example. Set
+# LINKCELL_ROOT to a directory with include/linkcell.h and a static
+# library liblinkcell.a (for example target/release of a cargo build).
+option(GISMO_WITH_LINKCELL "Use linkcell in ieti_elasticity_mpi_example" OFF)
+if(GISMO_WITH_LINKCELL AND TARGET ieti_elasticity_mpi_example)
+  find_path(LINKCELL_INCLUDE_DIR linkcell.h HINTS ${LINKCELL_ROOT} ${LINKCELL_ROOT}/include)
+  find_library(LINKCELL_LIBRARY NAMES liblinkcell.a linkcell HINTS ${LINKCELL_ROOT} ${LINKCELL_ROOT}/target/release)
+  if(NOT LINKCELL_INCLUDE_DIR OR NOT LINKCELL_LIBRARY)
+    message(FATAL_ERROR "GISMO_WITH_LINKCELL is ON but linkcell was not found; set LINKCELL_ROOT")
+  endif()
+  target_include_directories(ieti_elasticity_mpi_example PRIVATE ${LINKCELL_INCLUDE_DIR})
+  target_link_libraries(ieti_elasticity_mpi_example ${LINKCELL_LIBRARY} ${CMAKE_DL_LIBS} pthread)
+  target_compile_definitions(ieti_elasticity_mpi_example PRIVATE IETI_WITH_LINKCELL=1)
+endif()
+
 list(LENGTH FILES len)
 message(STATUS "Number of examples to compile: ${len}")
 
