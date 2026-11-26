@@ -175,6 +175,8 @@ struct Options
     std::string partition;     // lex, morton
     real_t  tol;
     index_t maxIt;
+    real_t  innerTol;          // tolerance of the inner CG of the fastdiag local solver
+    index_t innerMaxIt;
     bool    check, checkDirect, checkTopology, fastDiag, quiet;
     std::string cost;          // n or n2 (patch weight of the linkcell partition)
     index_t lcMethod;          // linkcell partition method
@@ -785,6 +787,215 @@ struct Timers
     Timers() : mapper(0), assembly(0), factor(0), coarse(0), rhs(0), solve(0), total(0) {}
 };
 
+
+/// Counters of the inner iterations
+struct InnerStats
+{
+    double dirCalls, dirIters, conCalls, conIters;
+    InnerStats() : dirCalls(0), dirIters(0), conCalls(0), conIters(0) {}
+};
+
+/// Sides (1..2*dim) of patch k that carry a clamp and/or an interface
+std::vector<int> patchSides(const Problem& P, index_t k, bool clamp, bool ifc)
+{
+    std::set<int> sides;
+    if (clamp)
+        for (size_t i=0; i<P.clampSides.size(); ++i)
+            if (P.clampSides[i].patch == k) sides.insert((int)P.clampSides[i].side());
+    if (ifc)
+        for (gsMultiPatch<>::const_iiterator it = P.mp.iBegin(); it != P.mp.iEnd(); ++it)
+        {
+            if (it->first().patch == k)  sides.insert((int)it->first().side());
+            if (it->second().patch == k) sides.insert((int)it->second().side());
+        }
+    return std::vector<int>(sides.begin(), sides.end());
+}
+
+/// Homogeneous Dirichlet conditions on the given sides of a single patch,
+/// one set per displacement component
+std::vector<gsBoundaryConditions<> > sidesAsBc(const Problem& P, const std::vector<int>& sides)
+{
+    std::vector<gsBoundaryConditions<> > bc(P.dim);
+    for (index_t r=0; r<P.dim; ++r)
+        for (size_t i=0; i<sides.size(); ++i)
+            bc[r].addCondition(patchSide(0, boxSide(sides[i])), condition_type::dirichlet, &P.zero);
+    return bc;
+}
+
+/// Conjugate gradient iteration for a symmetric positive definite sparse
+/// matrix; the preconditioner is an operator. Used as inexact solver for the
+/// Dirichlet problems of the scaled Dirichlet preconditioner.
+class InnerCg : public Op
+{
+public:
+    InnerCg(const SparseMatrix& A, OpPtr M, real_t tol, index_t maxit,
+            memory::shared_ptr<InnerStats> st)
+    : m_A(A), m_M(give(M)), m_tol(tol), m_maxit(maxit), m_st(st) {}
+
+    void apply(const Matrix& b, Matrix& x) const
+    {
+        const index_t n = m_A.rows();
+        x.setZero(n, 1);
+        Matrix r = b, z, Ap;
+        m_M->apply(r, z);
+        Matrix p = z;
+        real_t rz = r.col(0).dot(z.col(0));
+        const real_t rz0 = rz;
+        index_t it = 0;
+        if (rz0 > 0)
+            for (; it<m_maxit; ++it)
+            {
+                Ap = m_A * p;
+                const real_t a = rz / p.col(0).dot(Ap.col(0));
+                x += a * p;
+                r -= a * Ap;
+                m_M->apply(r, z);
+                const real_t rzn = r.col(0).dot(z.col(0));
+                if (rzn <= m_tol*m_tol*rz0) { ++it; break; }
+                p = z + (rzn/rz) * p;
+                rz = rzn;
+            }
+        m_st->dirCalls += 1;
+        m_st->dirIters += it;
+    }
+    index_t rows() const { return m_A.rows(); }
+    index_t cols() const { return m_A.rows(); }
+private:
+    SparseMatrix m_A;
+    OpPtr m_M;
+    real_t m_tol;
+    index_t m_maxit;
+    memory::shared_ptr<InnerStats> m_st;
+};
+
+/// Inexact solver for the local saddle point system
+///     A x + C^T mu = w,  C x = z
+/// (A singular on the rigid body modes, C the primal constraints) by the
+/// preconditioned conjugate gradient method projected onto the null space of C
+/// (Gould, Hribar and Nocedal, SIAM J. Sci. Comput. 23, 2001), with the
+/// preconditioner M^{-1} that is an exact inverse of a Kronecker sum. The
+/// constraint C x = z is satisfied to rounding by a particular solution
+/// M^{-1} C^T (C M^{-1} C^T)^{-1} z; only the residual in the null space of C
+/// is reduced iteratively. The input has the size n + nc (w, then z), the
+/// output the size n + nc (x, then zero).
+class ConstrainedCg : public Op
+{
+    typedef gsEigen::LDLT<gsEigen::Matrix<real_t,gsEigen::Dynamic,gsEigen::Dynamic> > DenseLDLT;
+public:
+    ConstrainedCg(const SparseMatrix& A, const std::vector<SparseVector>& constraints,
+                  OpPtr M, real_t tol, index_t maxit, memory::shared_ptr<InnerStats> st)
+    : m_A(A), m_M(give(M)), m_tol(tol), m_maxit(maxit), m_st(st)
+    {
+        const index_t n = A.rows(), nc = constraints.size();
+        m_C.resize(nc, n);
+        gsSparseEntries<real_t> se;
+        for (index_t i=0; i<nc; ++i)
+            for (SparseVector::InnerIterator it(constraints[i]); it; ++it)
+                se.add(i, it.row(), it.value());
+        m_C.setFrom(se);
+        Matrix Ct;
+        Ct.setZero(n, nc);
+        for (index_t i=0; i<nc; ++i)
+            for (SparseVector::InnerIterator it(constraints[i]); it; ++it)
+                Ct(it.row(), i) = it.value();
+        m_M->apply(Ct, m_MCt);
+        Matrix S = m_C * m_MCt;
+        m_S.compute(S);
+    }
+
+    void apply(const Matrix& in, Matrix& out) const
+    {
+        const index_t n = m_A.rows(), nc = m_C.rows();
+        Matrix w = in.topRows(n), z = in.bottomRows(nc);
+        Matrix x;
+        x.setZero(n, 1);
+        if (z.norm() > 0)
+            x = m_MCt * m_S.solve(z);
+        Matrix r = w - m_A * x;
+        Matrix v;
+        project(r, v);
+        Matrix p = v, Ap;
+        real_t rz = r.col(0).dot(v.col(0));
+        const real_t rz0 = rz;
+        index_t it = 0;
+        if (rz0 > 0)
+            for (; it<m_maxit; ++it)
+            {
+                Ap = m_A * p;
+                const real_t a = rz / p.col(0).dot(Ap.col(0));
+                x += a * p;
+                r -= a * Ap;
+                project(r, v);
+                const real_t rzn = r.col(0).dot(v.col(0));
+                if (rzn <= m_tol*m_tol*rz0) { ++it; break; }
+                p = v + (rzn/rz) * p;
+                rz = rzn;
+            }
+        m_st->conCalls += 1;
+        m_st->conIters += it;
+        out.setZero(n+nc, 1);
+        out.topRows(n) = x;
+    }
+    index_t rows() const { return m_A.rows() + m_C.rows(); }
+    index_t cols() const { return rows(); }
+private:
+    /// v = M^{-1} r - M^{-1} C^T (C M^{-1} C^T)^{-1} C M^{-1} r
+    void project(const Matrix& r, Matrix& v) const
+    {
+        m_M->apply(r, v);
+        Matrix t = m_S.solve(Matrix(m_C * v));
+        v -= m_MCt * t;
+    }
+    SparseMatrix m_A;
+    SparseMatrix m_C;
+    OpPtr m_M;
+    Matrix m_MCt;
+    DenseLDLT m_S;
+    real_t m_tol;
+    index_t m_maxit;
+    memory::shared_ptr<InnerStats> m_st;
+};
+
+/// Block diagonal fast diagonalization operator for the whole patch (all
+/// unknowns, natural conditions on the interfaces, Dirichlet on the clamped
+/// sides) that is the exact inverse of
+///   sum_k (mu + (lambda+mu) delta_ck) vol/e_k^2 (d_k u_c, d_k v_c) + alpha (u_c, v_c)
+/// on the parameter domain, for a box patch with edge lengths e_k and volume
+/// vol. alpha > 0 makes the blocks of floating patches invertible.
+OpPtr makeNeumannFd(const Problem& P, index_t k)
+{
+    const index_t dim = P.dim;
+    gsVector<> e(dim);
+    real_t vol = 1, emax = 0;
+    for (index_t d=0; d<dim; ++d)
+    {
+        e[d] = P.mp[k].coefs().col(d).maxCoeff() - P.mp[k].coefs().col(d).minCoeff();
+        vol *= e[d];
+        emax = std::max(emax, e[d]);
+    }
+    const real_t alpha = 1e-2 * P.mu * vol / (emax*emax);
+    const std::vector<gsBoundaryConditions<> > bc = sidesAsBc(P, patchSides(P, k, true, false));
+    gsBlockOp<>::Ptr blk = gsBlockOp<>::make(dim, dim);
+    for (index_t c=0; c<dim; ++c)
+    {
+        gsVector<> beta(dim);
+        for (index_t d=0; d<dim; ++d)
+            beta[d] = (P.mu + (c==d ? P.lambda+P.mu : 0.0)) * vol / (e[d]*e[d]);
+        blk->addOperator(c, c, gsPatchPreconditionersCreator<>::fastDiagonalizationOp(
+            P.mb[k], bc[c], gsAssembler<>::defaultOptions(), alpha, beta));
+    }
+    return blk;
+}
+
+/// Dirichlet fast diagonalization operator on the interior dofs of the patch
+/// (those not on a clamped or interface side)
+OpPtr makeDirichletFd(const Problem& P, index_t k)
+{
+    return gsPatchPreconditionersCreator<>::elasticityFastDiagonalizationOp(
+        P.mb[k], sidesAsBc(P, patchSides(P, k, true, true)), gsAssembler<>::defaultOptions(),
+        P.lambda, P.mu, &P.mp[k]);
+}
+
 struct OwnedPatch
 {
     index_t k, n;
@@ -800,7 +1011,7 @@ class IetiMpi
 {
 public:
     IetiMpi(const Problem& P, Par& par, const Options& o, std::vector<index_t> mine)
-    : m_P(P), m_par(par), m_opt(o), m_mine(give(mine)), m_schurOp(*this), m_precOp(*this) {}
+    : m_P(P), m_par(par), m_opt(o), m_mine(give(mine)), m_stats(new InnerStats), m_schurOp(*this), m_precOp(*this) {}
 
     void setup(Timers& t);
 
@@ -847,7 +1058,7 @@ public:
         return c(0,0);
     }
 
-    index_t nnzFactors() const { return 0; }
+    const InnerStats& stats() const { return *m_stats; }
 
 private:
     void applySchur(const Matrix& x, Matrix& y) const;
@@ -869,6 +1080,7 @@ private:
     Matrix              m_rhs;
     gsScaledDirichletPrec<> m_precLocal;
     OpPtr               m_precLocalOp;
+    memory::shared_ptr<InnerStats> m_stats;
     Schur               m_schurOp;
     Prec                m_precOp;
     friend class Schur;
@@ -902,34 +1114,70 @@ void IetiMpi::setup(Timers& t)
         p.n = raw.A.rows();
         p.f = raw.f;
 
+        const bool inexact = (m_opt.localSolver == "fastdiag");
+        const index_t nc = raw.constraints.size();
+
         // Scaled Dirichlet preconditioner: Schur complement on the skeleton
         {
             gsScaledDirichletPrec<>::Blocks blocks =
                 gsScaledDirichletPrec<>::matrixBlocks(raw.A, raw.skeleton);
+            OpPtr dirichletSolver;
+            if (inexact)
+            {
+                OpPtr M = makeDirichletFd(m_P, k);
+                GISMO_ENSURE(M->rows() == blocks.A11.rows(), "Fast diagonalization of patch " << k
+                    << " has " << M->rows() << " unknowns, the interior block " << blocks.A11.rows()
+                    << ": the patch is not a box with interfaces on the sides of its skeleton.");
+                dirichletSolver = memory::make_shared(new InnerCg(blocks.A11, M, m_opt.innerTol,
+                    m_opt.innerMaxIt, m_stats));
+            }
+            else
+                dirichletSolver = makeSparseCholeskySolver(blocks.A11);
             m_precLocal.addSubdomain(
                 gsScaledDirichletPrec<>::restrictJumpMatrix(raw.B, raw.skeleton).moveToPtr(),
-                gsScaledDirichletPrec<>::schurComplement(blocks, makeSparseCholeskySolver(blocks.A11))
+                gsScaledDirichletPrec<>::schurComplement(blocks, dirichletSolver)
             );
         }
-
-        // Primal constraints, local saddle point system, primal basis
-        SparseMatrix modA, embBasis;
-        Matrix rhsBasis;
-        gsPrimalSystem<>::incorporateConstraints(raw.constraints, m_opt.eliminateVertices,
-            raw.A, modA, p.E, embBasis, rhsBasis);
-        if (m_opt.localSolver == "ldlt")
-            p.solver = makeSparseCholeskySolver(modA);
-        else
-            p.solver = makeSparseLUSolver(modA);
-        SparseMatrix Psi = gsPrimalSystem<>::primalBasis(
-            p.solver, embBasis, rhsBasis, raw.primalIdx, nPrimal);
 
         const index_t m = raw.primalIdx.size();
         p.pdof = raw.primalIdx;
         p.Psi.setZero(p.n, m);
-        for (index_t j=0; j<m; ++j)
-            for (SparseMatrix::InnerIterator it(Psi, p.pdof[j]); it; ++it)
-                p.Psi(it.row(), j) = it.value();
+        if (inexact)
+        {
+            // Local saddle point system solved by projected CG; the primal
+            // basis is computed with the same solver.
+            gsSparseEntries<real_t> seE;
+            for (index_t i=0; i<p.n; ++i) seE.add(i, i, 1.0);
+            p.E.resize(p.n+nc, p.n);
+            p.E.setFrom(seE);
+            p.solver = memory::make_shared(new ConstrainedCg(raw.A, raw.constraints,
+                makeNeumannFd(m_P, k), m_opt.innerTol, m_opt.innerMaxIt, m_stats));
+            for (index_t j=0; j<m; ++j)
+            {
+                Matrix in;
+                in.setZero(p.n+nc, 1);
+                in(p.n+j, 0) = 1.0;
+                Matrix out;
+                p.solver->apply(in, out);
+                p.Psi.col(j) = out.topRows(p.n).col(0);
+            }
+        }
+        else
+        {
+            SparseMatrix modA, embBasis;
+            Matrix rhsBasis;
+            gsPrimalSystem<>::incorporateConstraints(raw.constraints, m_opt.eliminateVertices,
+                raw.A, modA, p.E, embBasis, rhsBasis);
+            if (m_opt.localSolver == "ldlt")
+                p.solver = makeSparseCholeskySolver(modA);
+            else
+                p.solver = makeSparseLUSolver(modA);
+            SparseMatrix Psi = gsPrimalSystem<>::primalBasis(
+                p.solver, embBasis, rhsBasis, raw.primalIdx, nPrimal);
+            for (index_t j=0; j<m; ++j)
+                for (SparseMatrix::InnerIterator it(Psi, p.pdof[j]); it; ++it)
+                    p.Psi(it.row(), j) = it.value();
+        }
 
         // Contribution to the coarse problem: Psi^T A Psi and Psi^T f
         {
@@ -1157,7 +1405,7 @@ int main(int argc, char* argv[])
     o.young = 1.0; o.poisson = 0.3;
     o.primal = "ve"; o.eliminateVertices = false;
     o.localSolver = "lu"; o.partition = "lex";
-    o.tol = 1e-12; o.maxIt = 500;
+    o.tol = 1e-12; o.maxIt = 500; o.innerTol = 1e-10; o.innerMaxIt = 1000;
     o.check = o.checkDirect = o.checkTopology = o.fastDiag = o.quiet = false;
     o.cost = "n2"; o.lcMethod = 1;
     o.gateMult = 1e-10; o.gateL2 = 1e-8; o.gateComp = 1e-8;
@@ -1174,7 +1422,9 @@ int main(int argc, char* argv[])
     cmd.addString("",  "traction",  "Traction vector on the face of maximal x", o.traction);
     cmd.addString("",  "primal",    "Primal space: v (vertices), ve (+ edge averages), vef (+ face averages)", o.primal);
     cmd.addSwitch("",  "eliminate-vertices", "Eliminate vertex constraints in the local systems", o.eliminateVertices);
-    cmd.addString("",  "local-solver", "Local solver: lu or ldlt (ldlt only with --eliminate-vertices and primal v)", o.localSolver);
+    cmd.addString("",  "local-solver", "Local solver: lu, ldlt (ldlt only with --eliminate-vertices and primal v) or fastdiag (inexact, inner CG preconditioned by fast diagonalization; box patches only)", o.localSolver);
+    cmd.addReal  ("",  "inner-tol", "Relative tolerance of the inner CG of --local-solver=fastdiag", o.innerTol);
+    cmd.addInt   ("",  "inner-maxit", "Maximum number of inner CG iterations", o.innerMaxIt);
     cmd.addString("",  "partition", "Patch distribution: lex, morton or linkcell (needs GISMO_WITH_LINKCELL)", o.partition);
     cmd.addString("",  "cost",      "Patch weight of the linkcell partition: n (unknowns) or n2 (squared)", o.cost);
     cmd.addInt   ("",  "lc-method", "linkcell partition method (1 Hilbert, 3 Hilbert + Fiduccia-Mattheyses)", o.lcMethod);
@@ -1200,6 +1450,12 @@ int main(int argc, char* argv[])
     tm.mapper = wallTime() - t0;
 
     GISMO_ENSURE(par.size <= P.nPatches, "More ranks than patches.");
+    if (o.localSolver == "fastdiag")
+    {
+        GISMO_ENSURE(!o.eliminateVertices, "--local-solver=fastdiag does not eliminate vertices.");
+        // The inexact operator differs from the exact one by the inner tolerance.
+        o.gateMult = o.gateL2 = o.gateComp = o.gateDirectL2 = o.gateDirectComp = 1e-6;
+    }
     if (o.localSolver == "ldlt")
         GISMO_ENSURE(o.eliminateVertices && o.primal == "v",
                      "--local-solver=ldlt requires --eliminate-vertices and --primal=v.");
@@ -1382,6 +1638,8 @@ int main(int argc, char* argv[])
                  tMapper   = par.maxOf(tm.mapper),   tComm   = par.maxOf(commSolve);
     const double nCalls   = (double)par.maxOf((index_t)par.commCalls);
     const real_t condMax  = cond;
+    const double dirCalls = par.sumOf(ieti.stats().dirCalls), dirIters = par.sumOf(ieti.stats().dirIters),
+                 conCalls = par.sumOf(ieti.stats().conCalls), conIters = par.sumOf(ieti.stats().conIters);
     int threads = 1;
 #ifdef _OPENMP
     threads = omp_get_max_threads();
@@ -1424,6 +1682,11 @@ int main(int argc, char* argv[])
            << " t_total=" << tTotal
            << " t_comm=" << tComm
            << " comm_calls=" << nCalls
+           << " local_solver=" << o.localSolver
+           << " inner_dir_calls=" << dirCalls
+           << " inner_dir_iters=" << dirIters
+           << " inner_con_calls=" << conCalls
+           << " inner_con_iters=" << conIters
            << " cond=" << condMax
            << " relres=" << relRes
            << " compliance=" << compliance
