@@ -899,7 +899,13 @@ public:
         for (index_t i=0; i<nc; ++i)
             for (SparseVector::InnerIterator it(constraints[i]); it; ++it)
                 Ct(it.row(), i) = it.value();
-        m_M->apply(Ct, m_MCt);
+        m_MCt.resize(n, nc);
+        for (index_t i=0; i<nc; ++i)
+        {
+            Matrix col = Ct.col(i), res;
+            m_M->apply(col, res);
+            m_MCt.col(i) = res.col(0);
+        }
         Matrix S = m_C * m_MCt;
         m_S.compute(S);
     }
