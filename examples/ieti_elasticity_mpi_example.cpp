@@ -128,6 +128,30 @@ struct Par
         if (size>1) MPI_Allreduce(&a, &r, 1, MPI_LONG_LONG, MPI_MAX, comm);
         return (index_t)r;
     }
+    /// Sum over the ranks, result on rank 0 only
+    void sumToRoot(Matrix& m)
+    {
+        if (size==1) return;
+        const double t = MPI_Wtime();
+        if (rank==0)
+            MPI_Reduce(MPI_IN_PLACE, m.data(), (int)m.size(), MPI_DOUBLE, MPI_SUM, 0, comm);
+        else
+            MPI_Reduce(m.data(), NULL, (int)m.size(), MPI_DOUBLE, MPI_SUM, 0, comm);
+        commTime  += MPI_Wtime() - t;
+        commCalls += 1;
+        commBytes += 8.0*m.size();
+    }
+    /// Broadcast from rank 0; m must have its final size on all ranks
+    void bcast(Matrix& m)
+    {
+        if (size==1) return;
+        const double t = MPI_Wtime();
+        MPI_Bcast(m.data(), (int)m.size(), MPI_DOUBLE, 0, comm);
+        commTime  += MPI_Wtime() - t;
+        commCalls += 1;
+        commBytes += 8.0*m.size();
+    }
+    void barrier() const { if (size>1) MPI_Barrier(comm); }
     template<class T> std::vector<T> allgatherv(const std::vector<T>& in, MPI_Datatype dt) const
     {
         if (size==1) return in;
@@ -145,6 +169,9 @@ struct Par
 #else
     Par() : rank(0), size(1), commTime(0), commCalls(0), commBytes(0) {}
     void   sum(Matrix&) {}
+    void   sumToRoot(Matrix&) {}
+    void   bcast(Matrix&) {}
+    void   barrier() const {}
     double maxOf(double v) const { return v; }
     double sumOf(double v) const { return v; }
     index_t minOf(index_t v) const { return v; }
@@ -181,6 +208,11 @@ struct Options
     std::string cost;          // n or n2 (patch weight of the linkcell partition)
     index_t lcMethod;          // linkcell partition method
     std::string tag;
+    bool    setupOnly;         // stop after the coarse problem, print the timing split
+    index_t emulateRanks;      // setup-only: build the mapper for the patches of rank 0 out of this many
+    std::string coarse;        // gather (triplets to all ranks) or reduce (one reduction of the values)
+    std::string coarseSolver;  // lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)
+    bool    coarseRoot;        // factorize the coarse matrix on rank 0 only and broadcast its solutions
     real_t  gateMult, gateL2, gateComp, gateDirectL2, gateDirectComp;
 };
 
@@ -255,8 +287,23 @@ typename std::iterator_traits<Iterator>::value_type blockDiagonal( Iterator begi
     return result;
 }
 
-void buildProblem(const Options& o, Problem& P)
+/// Wall times of the phases (seconds). The mapper phase is split into the
+/// topology of the multipatch, the bases, the dof mappers (gsIetiMapper::init),
+/// the primal constraints and the jump matrices; the coarse phase into the
+/// wait for the slowest rank, the assembly with its communication and the
+/// factorization.
+struct Timers
 {
+    double mapper, topo, basis, dofmap, primals, jumps;
+    double assembly, factor, wait, coarse, cassemble, cfactor, rhs, solve, total;
+    Timers() : mapper(0), topo(0), basis(0), dofmap(0), primals(0), jumps(0),
+               assembly(0), factor(0), wait(0), coarse(0), cassemble(0), cfactor(0),
+               rhs(0), solve(0), total(0) {}
+};
+
+void buildProblem(const Options& o, Problem& P, Timers& t)
+{
+    double t0 = wallTime();
     P.grid[0] = P.grid[1] = P.grid[2] = 0;
     if (!o.xml.empty())
     {
@@ -283,6 +330,8 @@ void buildProblem(const Options& o, Problem& P)
                 }
         P.mp.computeTopology();
     }
+    t.topo += wallTime() - t0;
+    t0 = wallTime();
     const index_t dim = P.dim;
     P.nPatches = P.mp.nPatches();
 
@@ -328,6 +377,9 @@ void buildProblem(const Options& o, Problem& P)
     for (index_t r=0; r<dim; ++r)
         P.bc[r].setGeoMap(P.mp);
 
+    t.basis += wallTime() - t0;
+    t0 = wallTime();
+
     // IETI mappers, one per displacement component
     P.mapper.resize(dim);
     for (index_t r=0; r<dim; ++r)
@@ -340,6 +392,7 @@ void buildProblem(const Options& o, Problem& P)
     P.nLambda = P.nPrimal = P.nUnknowns = 0;
     for (index_t r=0; r<dim; ++r)
         P.nUnknowns += P.mapper[r].dofMapperGlobal().freeSize();
+    t.dofmap += wallTime() - t0;
 }
 
 /// Primal constraints; averages are assembled for the given patches only
@@ -781,12 +834,6 @@ std::vector<index_t> distribute(const std::vector<int>& owner, int rank)
 // Distributed IETI-DP
 //---------------------------------------------------------------------------
 
-struct Timers
-{
-    double mapper, assembly, factor, coarse, rhs, solve, total;
-    Timers() : mapper(0), assembly(0), factor(0), coarse(0), rhs(0), solve(0), total(0) {}
-};
-
 
 /// Counters of the inner iterations
 struct InnerStats
@@ -1028,6 +1075,74 @@ OpPtr makeDirichletFd(const Problem& P, index_t k)
         P.lambda, P.mu, &P.mp[k]);
 }
 
+/// Direct solver of a sparse matrix as a linear operator
+template <class Solver>
+class SparseDirectOp : public Op
+{
+public:
+    explicit SparseDirectOp(const SparseMatrix& A) : m_n(A.rows())
+    {
+        m_solver.compute(A);
+        GISMO_ENSURE(m_solver.info() == gsEigen::Success, "Factorization of the coarse matrix failed.");
+    }
+    void apply(const Matrix& x, Matrix& y) const { y = m_solver.solve(x); }
+    index_t rows() const { return m_n; }
+    index_t cols() const { return m_n; }
+private:
+    Solver  m_solver;
+    index_t m_n;
+};
+
+OpPtr makeCoarseSolver(const SparseMatrix& A, const std::string& kind)
+{
+    if (kind == "ldlt")
+        return memory::make_shared(new SparseDirectOp< gsEigen::SimplicialLDLT<
+            gsEigen::SparseMatrix<real_t>, gsEigen::Lower, gsEigen::AMDOrdering<int> > >(A));
+    GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu or ldlt).");
+    return makeSparseLUSolver(A);
+}
+
+/// Compressed rows of the coarse matrix: the union of the dense blocks
+/// pdof x pdof of all patches. lists holds, for each patch, the number of its
+/// primal dofs followed by their global indices.
+struct CoarsePattern
+{
+    std::vector<int> start, col;
+
+    CoarsePattern(index_t n, const std::vector<int>& lists)
+    {
+        std::vector<int> cnt(n+1, 0);
+        for (size_t q=0; q<lists.size(); q += 1+lists[q])
+            for (int a=0; a<lists[q]; ++a)
+                cnt[lists[q+1+a]+1] += lists[q];
+        for (index_t i=0; i<n; ++i) cnt[i+1] += cnt[i];
+        std::vector<int> fill(cnt.begin(), cnt.end()-1), all(cnt[n]);
+        for (size_t q=0; q<lists.size(); q += 1+lists[q])
+            for (int a=0; a<lists[q]; ++a)
+            {
+                const int r = lists[q+1+a];
+                std::copy(lists.begin()+q+1, lists.begin()+q+1+lists[q], all.begin()+fill[r]);
+                fill[r] += lists[q];
+            }
+        start.assign(n+1, 0);
+        col.reserve(all.size()/2);
+        for (index_t i=0; i<n; ++i)
+        {
+            std::vector<int>::iterator b = all.begin()+cnt[i], e = all.begin()+cnt[i+1];
+            std::sort(b, e);
+            e = std::unique(b, e);
+            col.insert(col.end(), b, e);
+            start[i+1] = (int)col.size();
+        }
+    }
+    index_t nnz() const { return col.size(); }
+    /// Position of entry (i,j), which must be in the pattern
+    index_t pos(index_t i, index_t j) const
+    {
+        return std::lower_bound(col.begin()+start[i], col.begin()+start[i+1], (int)j) - col.begin();
+    }
+};
+
 struct OwnedPatch
 {
     index_t k, n;
@@ -1095,12 +1210,32 @@ public:
 private:
     void applySchur(const Matrix& x, Matrix& y) const;
     void applyPrec(const Matrix& x, Matrix& y) const;
+    /// Solution of the coarse problem. With --coarse-root the right-hand
+    /// side is needed on rank 0 only and the solution is broadcast.
     Matrix coarseSolve(const Matrix& g) const
     {
         Matrix out;
-        if (m_P.nPrimal > 0) m_coarse->apply(g, out);
+        if (m_P.nPrimal == 0) return out;
+        if (!m_opt.coarseRoot)
+        {
+            m_coarse->apply(g, out);
+            return out;
+        }
+        if (m_par.rank == 0)
+            m_coarse->apply(g, out);
+        else
+            out.resize(m_P.nPrimal, 1);
+        m_par.bcast(out);
         return out;
     }
+    /// Sum of the primal contributions over the ranks, where coarseSolve needs it
+    void sumPrimal(Matrix& g) const
+    {
+        if (m_opt.coarseRoot) m_par.sumToRoot(g);
+        else                  m_par.sum(g);
+    }
+    void setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj,
+                     const std::vector<double>& tv, Timers& t);
 
     const Problem&      m_P;
     Par&                m_par;
@@ -1274,21 +1409,16 @@ void IetiMpi::setup(Timers& t)
         t.factor += wallTime() - t0;
     }
 
-    // Coarse problem, replicated on all ranks
+    // The wait for the slowest rank is measured separately from the coarse work.
     double t0 = wallTime();
+    m_par.barrier();
+    t.wait += wallTime() - t0;
+
+    // Coarse problem
+    t0 = wallTime();
     if (nPrimal > 0)
     {
-        std::vector<int>    gi = m_par.gather(ti);
-        std::vector<int>    gj = m_par.gather(tj);
-        std::vector<double> gv = m_par.gather(tv);
-        gsSparseEntries<real_t> se;
-        se.reserve(gv.size());
-        for (size_t i=0; i<gv.size(); ++i)
-            se.add(gi[i], gj[i], gv[i]);
-        SparseMatrix Ac(nPrimal, nPrimal);
-        Ac.setFrom(se);
-        Ac.makeCompressed();
-        m_coarse = makeSparseLUSolver(Ac);
+        setupCoarse(ti, tj, tv, t);
         m_par.sum(fc);
     }
     m_fc = fc;
@@ -1324,6 +1454,66 @@ void IetiMpi::setup(Timers& t)
     t.rhs += wallTime() - t0;
 }
 
+/// Assembles and factorizes the coarse matrix from the local triplets
+/// (ti, tj, tv) of all ranks. --coarse=gather gathers the triplets on all
+/// ranks; --coarse=reduce gathers the primal indices of all patches, builds the
+/// sparsity pattern on every rank and sums the values with one reduction.
+/// With --coarse-root only rank 0 receives the matrix and factorizes it.
+void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj,
+                          const std::vector<double>& tv, Timers& t)
+{
+    const index_t nPrimal = m_P.nPrimal;
+    double t0 = wallTime();
+    SparseMatrix Ac(nPrimal, nPrimal);
+    const bool haveMatrix = !m_opt.coarseRoot || m_par.rank == 0;
+    if (m_opt.coarse == "gather")
+    {
+        std::vector<int>    gi = m_par.gather(ti);
+        std::vector<int>    gj = m_par.gather(tj);
+        std::vector<double> gv = m_par.gather(tv);
+        gsSparseEntries<real_t> se;
+        se.reserve(gv.size());
+        for (size_t i=0; i<gv.size(); ++i)
+            se.add(gi[i], gj[i], gv[i]);
+        Ac.setFrom(se);
+    }
+    else
+    {
+        GISMO_ENSURE(m_opt.coarse == "reduce", "Unknown coarse assembly " << m_opt.coarse
+                     << " (gather or reduce).");
+        std::vector<int> lists;
+        for (size_t q=0; q<m_patches.size(); ++q)
+        {
+            lists.push_back((int)m_patches[q].pdof.size());
+            for (size_t a=0; a<m_patches[q].pdof.size(); ++a)
+                lists.push_back((int)m_patches[q].pdof[a]);
+        }
+        const CoarsePattern pat(nPrimal, m_par.gather(lists));
+        Matrix val;
+        val.setZero(pat.nnz(), 1);
+        for (size_t i=0; i<tv.size(); ++i)
+            val(pat.pos(ti[i], tj[i]), 0) += tv[i];
+        if (m_opt.coarseRoot) m_par.sumToRoot(val);
+        else                  m_par.sum(val);
+        if (haveMatrix)
+        {
+            gsSparseEntries<real_t> se;
+            se.reserve(pat.nnz());
+            for (index_t r=0; r<nPrimal; ++r)
+                for (int p=pat.start[r]; p<pat.start[r+1]; ++p)
+                    se.add(r, pat.col[p], val(p,0));
+            Ac.setFrom(se);
+        }
+    }
+    Ac.makeCompressed();
+    t.cassemble += wallTime() - t0;
+
+    t0 = wallTime();
+    if (haveMatrix)
+        m_coarse = makeCoarseSolver(Ac, m_opt.coarseSolver);
+    t.cfactor += wallTime() - t0;
+}
+
 void IetiMpi::applySchur(const Matrix& x, Matrix& y) const
 {
     const index_t nPrimal = m_P.nPrimal;
@@ -1346,7 +1536,7 @@ void IetiMpi::applySchur(const Matrix& x, Matrix& y) const
     }
     if (nPrimal > 0)
     {
-        m_par.sum(g);
+        sumPrimal(g);
         Matrix yc = coarseSolve(g);
         for (size_t i=0; i<m_patches.size(); ++i)
         {
@@ -1380,7 +1570,7 @@ std::vector<Matrix> IetiMpi::reconstruct(const Matrix& lambda) const
     Matrix yc;
     if (nPrimal > 0)
     {
-        m_par.sum(g);
+        sumPrimal(g);
         yc = coarseSolve(m_fc - g);
     }
     std::vector<Matrix> u(m_patches.size());
@@ -1482,6 +1672,8 @@ int main(int argc, char* argv[])
     o.tol = 1e-12; o.maxIt = 500; o.innerTol = 1e-10; o.innerMaxIt = 1000;
     o.check = o.checkDirect = o.checkTopology = o.fastDiag = o.quiet = false;
     o.cost = "n2"; o.lcMethod = 1;
+    o.setupOnly = false; o.emulateRanks = 0;
+    o.coarse = "gather"; o.coarseSolver = "lu"; o.coarseRoot = false;
     o.gateMult = 1e-10; o.gateL2 = 1e-8; o.gateComp = 1e-8;
     o.gateDirectL2 = 1e-8; o.gateDirectComp = 1e-8;
 
@@ -1509,6 +1701,11 @@ int main(int argc, char* argv[])
     cmd.addSwitch("",  "check-direct", "Compare with a direct solve of the global system (gsElasticityAssembler)", o.checkDirect);
     cmd.addSwitch("q", "quiet",     "Print only the result line", o.quiet);
     cmd.addString("",  "tag",       "Label copied to the result line", o.tag);
+    cmd.addSwitch("",  "setup-only", "Stop after the coarse problem and print the timing split of the setup", o.setupOnly);
+    cmd.addInt   ("",  "emulate-ranks", "With --setup-only on one rank: build the mapper for the patches that rank 0 of this many ranks owns and stop after the mapper phase", o.emulateRanks);
+    cmd.addString("",  "coarse",    "Assembly of the coarse matrix: gather (triplets on all ranks) or reduce (pattern from the primal indices, one reduction of the values)", o.coarse);
+    cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)", o.coarseSolver);
+    cmd.addSwitch("",  "coarse-root", "Factorize the coarse matrix on rank 0 only and broadcast the coarse solutions", o.coarseRoot);
     try { cmd.getValues(argc, argv); } catch (int rv) { return rv; }
     if (o.traction.empty()) o.traction = (o.dim==3) ? "0,0,-1" : "0,-1";
 
@@ -1520,8 +1717,10 @@ int main(int argc, char* argv[])
     // Problem setup (replicated)
     Problem P;
     double t0 = wallTime();
-    buildProblem(o, P);
+    buildProblem(o, P, tm);
     tm.mapper = wallTime() - t0;
+    GISMO_ENSURE(o.emulateRanks == 0 || (o.setupOnly && par.size == 1),
+                 "--emulate-ranks needs --setup-only and one MPI rank.");
 
     GISMO_ENSURE(par.size <= P.nPatches, "More ranks than patches.");
     if (o.localSolver == "fastdiag" || o.localSolver == "fastdiag-dirichlet")
@@ -1535,9 +1734,10 @@ int main(int argc, char* argv[])
                      "--local-solver=ldlt requires --eliminate-vertices and --primal=v.");
 
     double tPart0 = wallTime();
-    const std::vector<int> owner = ownerOf(P, o, par.size);
+    const int parts = o.emulateRanks > 0 ? (int)o.emulateRanks : par.size;
+    const std::vector<int> owner = ownerOf(P, o, parts);
     const double tPartition = wallTime() - tPart0;
-    const PartStats pst = partitionStats(P, owner, par.size);
+    const PartStats pst = partitionStats(P, owner, parts);
     GISMO_ENSURE(pst.minPatches > 0, "Partition leaves a rank without patches.");
     std::vector<index_t> mine = distribute(owner, par.rank);
     // The jump matrices of the foreign patches are not stored unless a check
@@ -1545,11 +1745,52 @@ int main(int argc, char* argv[])
     t0 = wallTime();
     const std::vector<index_t> subset = (o.check || o.checkDirect) ? std::vector<index_t>() : mine;
     buildPrimals(P, o, subset);
+    tm.primals += wallTime() - t0;
+    double t1 = wallTime();
     buildJumps(P, subset);
+    tm.jumps += wallTime() - t1;
     tm.mapper += wallTime() - t0;
+
+    // Timing split of the setup (maximum over the ranks)
+    struct SetupReport
+    {
+        static void print(const Par& par, const Options& o, const Problem& P, const Timers& t,
+                          double tPartition, index_t owned, const char* stage)
+        {
+            const double v[] = { t.mapper, t.topo, t.basis, t.dofmap, t.primals, t.jumps,
+                                 t.assembly, t.factor, t.wait, t.coarse, t.cassemble, t.cfactor };
+            const char* k[] = { "t_mapper", "t_topo", "t_basis", "t_dofmap", "t_primals", "t_jumps",
+                                "t_assembly", "t_factor", "t_wait", "t_coarse", "t_cassemble", "t_cfactor" };
+            std::ostringstream os;
+            os.precision(6);
+            os << "SETUP stage=" << stage << " tag=" << (o.tag.empty() ? "-" : o.tag)
+               << " ranks=" << par.size << " emulate=" << o.emulateRanks
+               << " patches=" << P.nPatches << " owned=" << owned
+               << " grid=" << P.grid[0] << "x" << P.grid[1] << "x" << P.grid[2]
+               << " degree=" << o.degree << " refine=" << o.refine
+               << " unknowns=" << P.nUnknowns << " multipliers=" << P.nLambda << " primal=" << P.nPrimal
+               << " primal_type=" << o.primal << " partition=" << o.partition
+               << " coarse=" << o.coarse << " coarse_solver=" << o.coarseSolver
+               << " coarse_root=" << (o.coarseRoot ? 1 : 0)
+               << " t_partition=" << par.maxOf(tPartition);
+            for (size_t i=0; i<sizeof(v)/sizeof(v[0]); ++i)
+                os << " " << k[i] << "=" << par.maxOf(v[i]);
+            if (par.rank == 0) gsInfo << os.str() << "\n";
+        }
+    };
+    if (o.setupOnly && o.emulateRanks > 0)
+    {
+        SetupReport::print(par, o, P, tm, tPartition, mine.size(), "mapper");
+        return 0;
+    }
 
     IetiMpi ieti(P, par, o, mine);
     ieti.setup(tm);
+    if (o.setupOnly)
+    {
+        SetupReport::print(par, o, P, tm, tPartition, mine.size(), "coarse");
+        return 0;
+    }
 
     // Solve
     Matrix lambda;
@@ -1710,6 +1951,11 @@ int main(int argc, char* argv[])
                  tCoarse   = par.maxOf(tm.coarse),   tRhs    = par.maxOf(tm.rhs),
                  tSolveMax = par.maxOf(tm.solve),    tTotal  = par.maxOf(tm.total),
                  tMapper   = par.maxOf(tm.mapper),   tComm   = par.maxOf(commSolve);
+    Timers tMax;
+    tMax.topo = par.maxOf(tm.topo); tMax.dofmap = par.maxOf(tm.dofmap);
+    tMax.primals = par.maxOf(tm.primals); tMax.jumps = par.maxOf(tm.jumps);
+    tMax.wait = par.maxOf(tm.wait); tMax.cassemble = par.maxOf(tm.cassemble);
+    tMax.cfactor = par.maxOf(tm.cfactor);
     const double nCalls   = (double)par.maxOf((index_t)par.commCalls);
     const real_t condMax  = cond;
     const double dirCalls = par.sumOf(ieti.stats().dirCalls), dirIters = par.sumOf(ieti.stats().dirIters),
@@ -1746,9 +1992,19 @@ int main(int argc, char* argv[])
            << " lc_pairs=" << lcPairs
            << " topology=" << topo
            << " t_mapper=" << tMapper
+           << " t_topo=" << tMax.topo
+           << " t_dofmap=" << tMax.dofmap
+           << " t_primals=" << tMax.primals
+           << " t_jumps=" << tMax.jumps
            << " t_assembly=" << tAssembly
            << " t_factor=" << tFactor
+           << " t_wait=" << tMax.wait
            << " t_coarse=" << tCoarse
+           << " t_cassemble=" << tMax.cassemble
+           << " t_cfactor=" << tMax.cfactor
+           << " coarse=" << o.coarse
+           << " coarse_solver=" << o.coarseSolver
+           << " coarse_root=" << (o.coarseRoot ? 1 : 0)
            << " t_rhs=" << tRhs
            << " iterations=" << iterations
            << " t_solve=" << tSolveMax
