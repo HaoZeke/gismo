@@ -20,9 +20,11 @@
     assembles and factorizes only its own patches. The vector of Lagrange
     multipliers is replicated on all ranks. Every application of the Schur
     complement or of the preconditioner evaluates the contributions of the
-    local patches and sums them over the ranks with MPI_Allreduce. The primal
-    problem is replicated: the contributions to the coarse matrix are gathered
-    on all ranks and factorized there. Because the conjugate gradient
+    local patches and sums them over the ranks with MPI_Allreduce. The coarse
+    matrix is assembled with one reduction of its values over a sparsity
+    pattern that every rank builds from the primal indices of all patches,
+    and it is factorized on rank 0, which broadcasts the coarse solutions
+    (--coarse-on=all factorizes it on every rank). Because the conjugate gradient
     iteration only acts on replicated vectors, gsConjugateGradient is used
     unchanged.
 
@@ -211,8 +213,9 @@ struct Options
     bool    setupOnly;         // stop after the coarse problem, print the timing split
     index_t emulateRanks;      // setup-only: build the mapper for the patches of rank 0 out of this many
     std::string coarse;        // gather (triplets to all ranks) or reduce (one reduction of the values)
-    std::string coarseSolver;  // lu (SparseLU, COLAMD), lu-amd (SparseLU, AMD) or ldlt (SimplicialLDLT, AMD)
+    std::string coarseSolver;  // lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)
     bool    coarseRoot;        // factorize the coarse matrix on rank 0 only and broadcast its solutions
+    std::string coarseOn;      // root or all: where the coarse matrix is factorized
     real_t  gateMult, gateL2, gateComp, gateDirectL2, gateDirectComp;
 };
 
@@ -1098,10 +1101,7 @@ OpPtr makeCoarseSolver(const SparseMatrix& A, const std::string& kind)
     if (kind == "ldlt")
         return memory::make_shared(new SparseDirectOp< gsEigen::SimplicialLDLT<
             gsEigen::SparseMatrix<real_t>, gsEigen::Lower, gsEigen::AMDOrdering<int> > >(A));
-    if (kind == "lu-amd")
-        return memory::make_shared(new SparseDirectOp< gsEigen::SparseLU<
-            gsEigen::SparseMatrix<real_t>, gsEigen::AMDOrdering<int> > >(A));
-    GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu, lu-amd or ldlt).");
+    GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu or ldlt).");
     return makeSparseLUSolver(A);
 }
 
@@ -1213,7 +1213,7 @@ public:
 private:
     void applySchur(const Matrix& x, Matrix& y) const;
     void applyPrec(const Matrix& x, Matrix& y) const;
-    /// Solution of the coarse problem. With --coarse-root the right-hand
+    /// Solution of the coarse problem. With --coarse-on=root the right-hand
     /// side is needed on rank 0 only and the solution is broadcast.
     Matrix coarseSolve(const Matrix& g) const
     {
@@ -1461,7 +1461,7 @@ void IetiMpi::setup(Timers& t)
 /// (ti, tj, tv) of all ranks. --coarse=gather gathers the triplets on all
 /// ranks; --coarse=reduce gathers the primal indices of all patches, builds the
 /// sparsity pattern on every rank and sums the values with one reduction.
-/// With --coarse-root only rank 0 receives the matrix and factorizes it.
+/// With --coarse-on=root only rank 0 receives the matrix and factorizes it.
 void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj,
                           const std::vector<double>& tv, Timers& t)
 {
@@ -1676,7 +1676,7 @@ int main(int argc, char* argv[])
     o.check = o.checkDirect = o.checkTopology = o.fastDiag = o.quiet = false;
     o.cost = "n2"; o.lcMethod = 1;
     o.setupOnly = false; o.emulateRanks = 0;
-    o.coarse = "gather"; o.coarseSolver = "lu"; o.coarseRoot = false;
+    o.coarse = "reduce"; o.coarseSolver = "lu"; o.coarseOn = "root";
     o.gateMult = 1e-10; o.gateL2 = 1e-8; o.gateComp = 1e-8;
     o.gateDirectL2 = 1e-8; o.gateDirectComp = 1e-8;
 
@@ -1707,9 +1707,11 @@ int main(int argc, char* argv[])
     cmd.addSwitch("",  "setup-only", "Stop after the coarse problem and print the timing split of the setup", o.setupOnly);
     cmd.addInt   ("",  "emulate-ranks", "With --setup-only on one rank: build the mapper for the patches that rank 0 of this many ranks owns and stop after the mapper phase", o.emulateRanks);
     cmd.addString("",  "coarse",    "Assembly of the coarse matrix: gather (triplets on all ranks) or reduce (pattern from the primal indices, one reduction of the values)", o.coarse);
-    cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD ordering), lu-amd (SparseLU, AMD ordering) or ldlt (SimplicialLDLT, AMD ordering)", o.coarseSolver);
-    cmd.addSwitch("",  "coarse-root", "Factorize the coarse matrix on rank 0 only and broadcast the coarse solutions", o.coarseRoot);
+    cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD ordering) or ldlt (SimplicialLDLT, AMD ordering)", o.coarseSolver);
+    cmd.addString("",  "coarse-on", "Where the coarse matrix is factorized: root (rank 0, the coarse solutions are broadcast) or all (every rank)", o.coarseOn);
     try { cmd.getValues(argc, argv); } catch (int rv) { return rv; }
+    GISMO_ENSURE(o.coarseOn == "root" || o.coarseOn == "all", "--coarse-on is root or all.");
+    o.coarseRoot = (o.coarseOn == "root");
     if (o.traction.empty()) o.traction = (o.dim==3) ? "0,0,-1" : "0,-1";
 
     const double tStart = wallTime();
