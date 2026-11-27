@@ -28,6 +28,17 @@
     iteration only acts on replicated vectors, gsConjugateGradient is used
     unchanged.
 
+    With --multipliers=distributed a rank holds only the multipliers that
+    touch its patches. A multiplier couples two patches, so it lives on one
+    rank or on two; an operator application adds the contribution of the
+    other rank with one MPI_Neighbor_alltoallv over the graph of adjacent
+    ranks (MPI_Dist_graph_create_adjacent), and the conjugate gradient
+    iteration reduces one scalar per inner product. The adjacent ranks and
+    the shared multipliers come from a search over the own patches and the
+    patches near them (linkcell: halo cells of the patch grid and a pair
+    search over the Greville points of the coupled dofs), followed by one
+    exchange of candidate lists between adjacent ranks.
+
     The program checks its own result and exits with a non-zero code if a
     check fails (option --check compares with the serial IETI-DP implementation
     of the library classes, option --check-direct with a direct solve of the
@@ -47,6 +58,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iterator>
+#include <map>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -168,6 +181,32 @@ struct Par
     }
     static MPI_Datatype dtype(const int*)    { return MPI_INT;    }
     static MPI_Datatype dtype(const double*) { return MPI_DOUBLE; }
+    /// Ranks adjacent to this one: the given list and every rank that lists
+    /// this rank, ascending. One gather of all lists (ranks times degree ints).
+    std::vector<int> symmetricNeighbours(const std::vector<int>& nbr) const
+    {
+        std::vector<int> edges;
+        for (size_t i=0; i<nbr.size(); ++i) { edges.push_back(rank); edges.push_back(nbr[i]); }
+        const std::vector<int> all = allgatherv(edges, MPI_INT);
+        std::vector<int> out;
+        for (size_t i=0; i+1<all.size(); i+=2)
+        {
+            if (all[i] == rank && all[i+1] != rank) out.push_back(all[i+1]);
+            if (all[i+1] == rank && all[i] != rank) out.push_back(all[i]);
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+    /// Communicator with the adjacent ranks as sources and destinations
+    MPI_Comm neighbourGraph(const std::vector<int>& nbr) const
+    {
+        MPI_Comm g;
+        const int deg = (int)nbr.size();
+        MPI_Dist_graph_create_adjacent(comm, deg, deg ? nbr.data() : NULL, MPI_UNWEIGHTED,
+            deg, deg ? nbr.data() : NULL, MPI_UNWEIGHTED, MPI_INFO_NULL, 0, &g);
+        return g;
+    }
 #else
     Par() : rank(0), size(1), commTime(0), commCalls(0), commBytes(0) {}
     void   sum(Matrix&) {}
@@ -216,6 +255,8 @@ struct Options
     std::string coarseSolver;  // lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)
     bool    coarseRoot;        // factorize the coarse matrix on rank 0 only and broadcast its solutions
     std::string coarseOn;      // root or all: where the coarse matrix is factorized
+    std::string multipliers;   // replicated (one reduction per application) or distributed (neighbour exchange)
+    std::string dualNeighbours; // linkcell (halo and pair search) or mapper (inverse of the global dof mapper)
     real_t  gateMult, gateL2, gateComp, gateDirectL2, gateDirectComp;
 };
 
@@ -298,10 +339,10 @@ typename std::iterator_traits<Iterator>::value_type blockDiagonal( Iterator begi
 struct Timers
 {
     double mapper, topo, basis, dofmap, primals, jumps;
-    double assembly, factor, wait, coarse, cassemble, cfactor, rhs, solve, total;
+    double assembly, factor, wait, coarse, cassemble, cfactor, rhs, solve, total, dual;
     Timers() : mapper(0), topo(0), basis(0), dofmap(0), primals(0), jumps(0),
                assembly(0), factor(0), wait(0), coarse(0), cassemble(0), cfactor(0),
-               rhs(0), solve(0), total(0) {}
+               rhs(0), solve(0), total(0), dual(0) {}
 };
 
 void buildProblem(const Options& o, Problem& P, Timers& t)
@@ -834,6 +875,501 @@ std::vector<index_t> distribute(const std::vector<int>& owner, int rank)
 }
 
 //---------------------------------------------------------------------------
+// Layout of the multiplier vector
+//---------------------------------------------------------------------------
+
+/// Layout of the multiplier vector on one rank.
+///
+/// Replicated: every rank holds all nLambda entries and every operator
+/// application ends with one reduction of the whole vector.
+///
+/// Distributed: a rank holds the multipliers that touch its patches, in
+/// ascending global order. A multiplier couples two patches, so it lives on
+/// one rank or on two; the lower rank owns it. All vectors are kept
+/// consistent (both holders carry the full value). An operator application
+/// produces the contribution of the own patches and adds the contribution of
+/// the other holder with one neighbourhood exchange; inner products sum the
+/// owned entries and reduce one scalar.
+struct Dual
+{
+    bool    distributed;
+    index_t nGlobal, nLocal, nOwned, nShared, nNbr;
+    std::vector<index_t> glob;     ///< global index of each local multiplier, ascending
+    Matrix  weight;                ///< 1 for the owned multipliers, 0 for the others
+    std::vector<int> nbr;          ///< adjacent ranks, ascending
+    std::vector<int> cnt, dsp;     ///< shared multipliers per adjacent rank
+    std::vector<int> idx;          ///< local indices of the shared multipliers, by adjacent rank, ascending global index
+    mutable std::vector<double> sbuf, rbuf;
+#ifdef GISMO_WITH_MPI
+    MPI_Comm graph;
+#endif
+
+    Dual() : distributed(false), nGlobal(0), nLocal(0), nOwned(0), nShared(0), nNbr(0)
+#ifdef GISMO_WITH_MPI
+    , graph(MPI_COMM_NULL)
+#endif
+    {}
+
+    index_t local(index_t g) const
+    {
+        const std::vector<index_t>::const_iterator it = std::lower_bound(glob.begin(), glob.end(), g);
+        GISMO_ENSURE(it != glob.end() && *it == g, "Multiplier " << g << " is not held by this rank.");
+        return (index_t)(it - glob.begin());
+    }
+
+    /// Rows of a jump matrix in the numbering of this layout
+    JumpMatrix rows(const JumpMatrix& B) const
+    {
+        if (!distributed) return B;
+        gsSparseEntries<real_t> se;
+        se.reserve(B.nonZeros());
+        for (index_t i=0; i<B.outerSize(); ++i)
+            for (JumpMatrix::InnerIterator it(B, i); it; ++it)
+                se.add(local(it.row()), it.col(), it.value());
+        JumpMatrix R(nLocal, B.cols());
+        R.setFrom(se);
+        return R;
+    }
+
+    /// Completes a vector of own contributions to the consistent vector
+    void accumulate(Par& par, Matrix& y) const
+    {
+        if (!distributed) { par.sum(y); return; }
+#ifdef GISMO_WITH_MPI
+        if (nbr.empty()) return;
+        const double t = MPI_Wtime();
+        for (size_t i=0; i<idx.size(); ++i) sbuf[i] = y(idx[i],0);
+        MPI_Neighbor_alltoallv(sbuf.data(), cnt.data(), dsp.data(), MPI_DOUBLE,
+                               rbuf.data(), cnt.data(), dsp.data(), MPI_DOUBLE, graph);
+        for (size_t i=0; i<idx.size(); ++i) y(idx[i],0) += rbuf[i];
+        par.commTime  += MPI_Wtime() - t;
+        par.commCalls += 1;
+        par.commBytes += 8.0*idx.size();
+#endif
+    }
+
+    /// Inner product of two consistent vectors
+    real_t dot(Par& par, const Matrix& a, const Matrix& b) const
+    {
+        if (!distributed) return a.col(0).dot(b.col(0));
+        real_t s = 0;
+        for (index_t i=0; i<nLocal; ++i) s += weight(i,0)*a(i,0)*b(i,0);
+#ifdef GISMO_WITH_MPI
+        if (par.size > 1)
+        {
+            const double t = MPI_Wtime();
+            real_t r = s;
+            MPI_Allreduce(&s, &r, 1, MPI_DOUBLE, MPI_SUM, par.comm);
+            s = r;
+            par.commTime  += MPI_Wtime() - t;
+            par.commCalls += 1;
+            par.commBytes += 8.0;
+        }
+#endif
+        return s;
+    }
+
+    real_t norm(Par& par, const Matrix& a) const { return math::sqrt(dot(par, a, a)); }
+
+    /// The vector in the global numbering, on every rank (for the checks)
+    Matrix global(Par& par, const Matrix& x) const
+    {
+        if (!distributed) return x;
+        Matrix g;
+        g.setZero(nGlobal, 1);
+        for (index_t i=0; i<nLocal; ++i)
+            if (weight(i,0) != 0) g(glob[i],0) = x(i,0);
+        par.sum(g);
+        return g;
+    }
+};
+
+/// A coupled dof of an own patch that coincides with a dof of a patch of
+/// another rank: (own patch, basis index, other patch)
+struct Partner
+{
+    index_t k, i, other;
+    bool operator<(const Partner& o) const
+    { return k != o.k ? k < o.k : (i != o.i ? i < o.i : other < o.other); }
+    bool operator==(const Partner& o) const { return k == o.k && i == o.i && other == o.other; }
+};
+
+/// Partners from the inverse of the global dof mapper (built from all
+/// patches, on every rank)
+std::vector<Partner> partnersMapper(const Problem& P, const std::vector<int>& owner, int rank)
+{
+    const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
+    std::vector<std::vector<index_t> > groups(dm.coupledSize());
+    for (index_t k=0; k<P.nPatches; ++k)
+        for (index_t i=0; i<dm.patchSize(k); ++i)
+            if (dm.is_coupled(i,k)) groups[dm.cindex(i,k)].push_back(k);
+    std::vector<Partner> out;
+    for (index_t k=0; k<P.nPatches; ++k)
+    {
+        if (owner[k] != rank) continue;
+        for (index_t i=0; i<dm.patchSize(k); ++i)
+        {
+            if (!dm.is_coupled(i,k)) continue;
+            const std::vector<index_t>& g = groups[dm.cindex(i,k)];
+            for (size_t a=0; a<g.size(); ++a)
+                if (owner[g[a]] != rank)
+                { Partner p; p.k = k; p.i = i; p.other = g[a]; out.push_back(p); }
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+/// Patches of other ranks that touch a patch of this rank, from the inverse
+/// of the global dof mapper
+std::vector<index_t> haloPatchesMapper(const Problem& P, const std::vector<int>& owner, int rank)
+{
+    const std::vector<Partner> pr = partnersMapper(P, owner, rank);
+    std::set<index_t> h;
+    for (size_t q=0; q<pr.size(); ++q) h.insert(pr[q].other);
+    return std::vector<index_t>(h.begin(), h.end());
+}
+
+#ifdef IETI_WITH_LINKCELL
+/// Candidate patches of other ranks near the patches of this rank: the patch
+/// centroids are binned with cells of one patch extent and lc_halo returns
+/// the cells within one patch extent of a cell that holds an own patch.
+std::vector<index_t> haloPatchesLinkcell(const Problem& P, const std::vector<int>& owner, int rank, int parts)
+{
+    std::vector<index_t> out;
+    if (parts < 2) return out;
+    const std::vector<double> xyz = patchCentroids(P);
+    const double ext = patchExtent(P);
+    const lc_cell box = lcBox(xyz, 2*ext);
+    const double cutoff = 1.5*ext;
+    const size_t n = P.nPatches;
+    size_t ncell = 0;
+    int nxyz[3];
+    double width[3];
+    GISMO_ENSURE(0 == lc_mesh_cut(xyz.data(), n, &box, cutoff, NULL, ext, parts, 1, 0.0, 0,
+        nxyz, width, NULL, NULL, 0, 0, &ncell), "lc_mesh_cut query failed: " << lc_last_error());
+    std::vector<int> domain(ncell), pointCell(n);
+    GISMO_ENSURE(0 == lc_mesh_cut(xyz.data(), n, &box, cutoff, NULL, ext, parts, 1, 0.0, 0,
+        nxyz, width, domain.data(), pointCell.data(), ncell, n, &ncell),
+        "lc_mesh_cut failed: " << lc_last_error());
+    std::vector<int> assign(ncell, 0);
+    for (size_t k=0; k<n; ++k)
+        if (owner[k] == rank) assign[pointCell[k]] = 1;
+    uint32_t reach[3];
+    GISMO_ENSURE(0 == lc_halo_width(ext, 1, width, reach), "lc_halo_width failed: " << lc_last_error());
+    size_t nGhost = 0;
+    GISMO_ENSURE(0 == lc_halo(nxyz, assign.data(), ncell, 1, reach, NULL, 0, &nGhost),
+        "lc_halo query failed: " << lc_last_error());
+    std::vector<int> ghost(std::max<size_t>(nGhost, 1));
+    GISMO_ENSURE(0 == lc_halo(nxyz, assign.data(), ncell, 1, reach, ghost.data(), nGhost, &nGhost),
+        "lc_halo failed: " << lc_last_error());
+    for (size_t g=0; g<nGhost; ++g) assign[ghost[g]] = 1;
+    for (size_t k=0; k<n; ++k)
+        if (owner[k] != rank && assign[pointCell[k]]) out.push_back((index_t)k);
+    return out;
+}
+
+/// Partners from lc_pairs_within_csr on the physical images of the Greville
+/// points of the coupled dofs of the own patches and of the halo patches.
+/// The cutoff is a small fraction of the element size.
+std::vector<Partner> partnersLinkcell(const Problem& P, const std::vector<int>& owner, int rank,
+                                      const std::vector<index_t>& halo)
+{
+    std::vector<Partner> out;
+    if (halo.empty()) return out;
+    std::vector<index_t> patches = halo;
+    for (index_t k=0; k<P.nPatches; ++k)
+        if (owner[k] == rank) patches.push_back(k);
+    std::vector<double> pts;
+    std::vector<index_t> pointPatch, pointDof;
+    const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
+    double h = 1e300;
+    for (size_t q=0; q<patches.size(); ++q)
+    {
+        const index_t k = patches[q];
+        gsMatrix<> anc = P.mb[k].anchors();
+        gsMatrix<> x;
+        P.mp[k].eval_into(anc, x);
+        for (index_t i=0; i<anc.cols(); ++i)
+            if (dm.is_coupled(i,k))
+            {
+                for (index_t d=0; d<3; ++d) pts.push_back(d<x.rows() ? x(d,i) : 0.0);
+                pointPatch.push_back(k);
+                pointDof.push_back(i);
+            }
+        double ext = 1e300;
+        for (index_t d=0; d<P.dim; ++d)
+            ext = std::min(ext, (double)(P.mp[k].coefs().col(d).maxCoeff() - P.mp[k].coefs().col(d).minCoeff()));
+        h = std::min(h, ext / std::pow((double)P.mb[k].numElements(), 1.0/P.dim));
+    }
+    const double eps = 1e-3*h;
+    const lc_cell box = lcBox(pts, 2*h);
+    const size_t n = pointPatch.size();
+    size_t needOff = 0, needCols = 0;
+    int pbc[3] = {0,0,0};
+    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 2*h, 0,
+        NULL, 0, NULL, NULL, 0, &needOff, &needCols), "lc_pairs_within_csr query failed: " << lc_last_error());
+    std::vector<int> off(needOff), cols(std::max<size_t>(needCols, 1));
+    GISMO_ENSURE(0 == lc_pairs_within_csr(pts.data(), n, &box, pbc, eps, NULL, 2*h, 0,
+        off.data(), needOff, cols.data(), NULL, needCols, &needOff, &needCols),
+        "lc_pairs_within_csr failed: " << lc_last_error());
+    for (size_t a=0; a<n; ++a)
+    {
+        if (owner[pointPatch[a]] != rank) continue;
+        for (int c=off[a]; c<off[a+1]; ++c)
+        {
+            const index_t ko = pointPatch[cols[c]];
+            if (owner[ko] == rank) continue;
+            Partner p; p.k = pointPatch[a]; p.i = pointDof[a]; p.other = ko;
+            out.push_back(p);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+#endif
+
+/// Patches of other ranks that can share multipliers with this rank
+std::vector<index_t> haloPatches(const Problem& P, const Options& o, const std::vector<int>& owner,
+                                 int rank, int parts)
+{
+#ifdef IETI_WITH_LINKCELL
+    if (o.dualNeighbours == "linkcell") return haloPatchesLinkcell(P, owner, rank, parts);
+#endif
+    GISMO_ENSURE(o.dualNeighbours == "mapper", "--dual-neighbours=" << o.dualNeighbours
+                 << " is not available (mapper, or linkcell with GISMO_WITH_LINKCELL).");
+    GISMO_UNUSED(parts);
+    return haloPatchesMapper(P, owner, rank);
+}
+
+/// Global rows of the multipliers of a patch: all rows, and the rows per
+/// column of each displacement component
+struct PatchRows
+{
+    std::vector<index_t> all;
+    std::vector<std::vector<std::vector<index_t> > > byCol;  // [component][column] -> rows
+};
+
+PatchRows patchRows(const Problem& P, index_t k, bool withColumns)
+{
+    PatchRows pr;
+    pr.byCol.resize(P.dim);
+    index_t rowOff = 0;
+    for (index_t r=0; r<P.dim; ++r)
+    {
+        const JumpMatrix& J = P.mapper[r].jumpMatrix(k);
+        if (withColumns) pr.byCol[r].resize(J.cols());
+        for (index_t i=0; i<J.outerSize(); ++i)
+            for (JumpMatrix::InnerIterator it(J, i); it; ++it)
+            {
+                pr.all.push_back(rowOff + it.row());
+                if (withColumns) pr.byCol[r][it.col()].push_back(rowOff + it.row());
+            }
+        rowOff += P.mapper[r].nLagrangeMultipliers();
+    }
+    std::sort(pr.all.begin(), pr.all.end());
+    pr.all.erase(std::unique(pr.all.begin(), pr.all.end()), pr.all.end());
+    return pr;
+}
+
+/// Builds the layout of the multiplier vector of this rank.
+///
+/// Distributed layout: the partners give, for every adjacent rank, the
+/// multipliers in the columns of the dofs that coincide with a dof of that
+/// rank (a superset of the shared ones). The adjacent ranks exchange these
+/// lists once over the neighbourhood graph; the multipliers shared by two
+/// ranks are the intersection of the two lists, in ascending global order
+/// on both sides.
+///
+/// With emulate > 0 (one process, rank 0 of emulate ranks) the lists of the
+/// other side are the rows of the jump matrices of the halo patches, which
+/// the caller has built.
+Dual buildDual(const Problem& P, const Options& o, Par& par, const std::vector<int>& owner,
+               const std::vector<index_t>& mine, const std::vector<index_t>& halo, int& status,
+               std::string& failures)
+{
+    Dual D;
+    D.nGlobal = P.nLambda;
+    D.distributed = (o.multipliers == "distributed");
+    if (!D.distributed)
+    {
+        D.nLocal = D.nOwned = P.nLambda;
+        return D;
+    }
+    const int rank = par.rank;
+    const bool emulate = o.emulateRanks > 0;
+
+    std::vector<Partner> partners;
+#ifdef IETI_WITH_LINKCELL
+    if (o.dualNeighbours == "linkcell")
+    {
+        partners = partnersLinkcell(P, owner, rank, halo);
+        if (o.check || o.checkTopology)
+        {
+            // The pair search must find the couplings of the dof mapper
+            if (!(partners == partnersMapper(P, owner, rank)))
+            { status = 1; failures += " dual-partners"; }
+        }
+    }
+    else
+#endif
+        partners = partnersMapper(P, owner, rank);
+
+    // Local multipliers and the candidates per adjacent rank
+    std::map<int, std::vector<long long> > cand;
+    size_t q = 0;
+    for (size_t m=0; m<mine.size(); ++m)
+    {
+        const index_t k = mine[m];
+        const PatchRows pr = patchRows(P, k, true);
+        D.glob.insert(D.glob.end(), pr.all.begin(), pr.all.end());
+        while (q < partners.size() && partners[q].k < k) ++q;
+        for (; q < partners.size() && partners[q].k == k; ++q)
+        {
+            std::vector<long long>& c = cand[owner[partners[q].other]];
+            for (index_t r=0; r<P.dim; ++r)
+            {
+                const gsDofMapper& dl = P.mapper[r].dofMapperLocal(k);
+                if (!dl.is_free(partners[q].i, 0)) continue;
+                const std::vector<index_t>& rows = pr.byCol[r][dl.index(partners[q].i, 0)];
+                c.insert(c.end(), rows.begin(), rows.end());
+            }
+        }
+    }
+    std::sort(D.glob.begin(), D.glob.end());
+    D.glob.erase(std::unique(D.glob.begin(), D.glob.end()), D.glob.end());
+    D.nLocal = (index_t)D.glob.size();
+    for (std::map<int, std::vector<long long> >::iterator it = cand.begin(); it != cand.end(); ++it)
+    {
+        std::sort(it->second.begin(), it->second.end());
+        it->second.erase(std::unique(it->second.begin(), it->second.end()), it->second.end());
+    }
+
+    std::vector<std::vector<long long> > other;   // candidates of the adjacent ranks, by adjacent rank
+    if (emulate)
+    {
+        std::map<int, std::vector<long long> > rowsOf;
+        for (size_t hq=0; hq<halo.size(); ++hq)
+        {
+            const PatchRows pr = patchRows(P, halo[hq], false);
+            std::vector<long long>& v = rowsOf[owner[halo[hq]]];
+            v.insert(v.end(), pr.all.begin(), pr.all.end());
+        }
+        for (std::map<int, std::vector<long long> >::iterator it = cand.begin(); it != cand.end(); ++it)
+        {
+            std::vector<long long>& v = rowsOf[it->first];
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+            D.nbr.push_back(it->first);
+            other.push_back(v);
+        }
+    }
+    else
+    {
+#ifdef GISMO_WITH_MPI
+        std::vector<int> first;
+        for (std::map<int, std::vector<long long> >::iterator it = cand.begin(); it != cand.end(); ++it)
+            first.push_back(it->first);
+        D.nbr = par.symmetricNeighbours(first);
+        D.graph = par.neighbourGraph(D.nbr);
+        const int deg = (int)D.nbr.size();
+        std::vector<int> scnt(std::max(deg,1), 0), sdsp(std::max(deg,1), 0),
+                         rcnt(std::max(deg,1), 0), rdsp(std::max(deg,1), 0);
+        std::vector<long long> sendIds;
+        for (int j=0; j<deg; ++j)
+        {
+            const std::vector<long long>& c = cand[D.nbr[j]];
+            sdsp[j] = (int)sendIds.size();
+            scnt[j] = (int)c.size();
+            sendIds.insert(sendIds.end(), c.begin(), c.end());
+        }
+        MPI_Neighbor_alltoall(scnt.data(), 1, MPI_INT, rcnt.data(), 1, MPI_INT, D.graph);
+        int tot = 0;
+        for (int j=0; j<deg; ++j) { rdsp[j] = tot; tot += rcnt[j]; }
+        std::vector<long long> recvIds(std::max(tot,1));
+        sendIds.resize(std::max<size_t>(sendIds.size(), 1));
+        MPI_Neighbor_alltoallv(sendIds.data(), scnt.data(), sdsp.data(), MPI_LONG_LONG,
+                               recvIds.data(), rcnt.data(), rdsp.data(), MPI_LONG_LONG, D.graph);
+        for (int j=0; j<deg; ++j)
+            other.push_back(std::vector<long long>(recvIds.begin()+rdsp[j], recvIds.begin()+rdsp[j]+rcnt[j]));
+#endif
+    }
+
+    D.weight.setOnes(D.nLocal, 1);
+    D.cnt.assign(std::max<size_t>(D.nbr.size(), 1), 0);
+    D.dsp.assign(std::max<size_t>(D.nbr.size(), 1), 0);
+    for (size_t j=0; j<D.nbr.size(); ++j)
+    {
+        const std::vector<long long>& c = cand[D.nbr[j]];
+        std::vector<long long> shared;
+        std::set_intersection(c.begin(), c.end(), other[j].begin(), other[j].end(),
+                              std::back_inserter(shared));
+        D.dsp[j] = (int)D.idx.size();
+        D.cnt[j] = (int)shared.size();
+        if (!shared.empty()) D.nNbr += 1;
+        for (size_t a=0; a<shared.size(); ++a)
+        {
+            const index_t l = D.local((index_t)shared[a]);
+            D.idx.push_back((int)l);
+            if (D.nbr[j] < rank) D.weight(l,0) = 0;
+        }
+    }
+    D.nShared = (index_t)D.idx.size();
+    D.nOwned  = (index_t)D.weight.sum();
+    D.sbuf.assign(std::max<size_t>(D.idx.size(), 1), 0.0);
+    D.rbuf.assign(std::max<size_t>(D.idx.size(), 1), 0.0);
+
+    // A multiplier held by two ranks appears once in the exchange lists of
+    // each; every multiplier has exactly one owner.
+    {
+        std::vector<int> sorted(D.idx);
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end())
+        { status = 1; failures += " dual-shared-twice"; }
+    }
+    if (!emulate)
+    {
+        const double owned = par.sumOf((double)D.nOwned);
+        if (owned != (double)P.nLambda)
+        { status = 1; failures += " dual-ownership"; }
+    }
+    return D;
+}
+
+/// Seconds per CG iteration spent in the multiplier-vector arithmetic of the
+/// given patches: two applications of B^T and B per patch, the three vector
+/// updates and the three inner products. The local solves are left out.
+double dualKernelTime(const std::vector<JumpMatrix>& B, index_t n, index_t reps)
+{
+    Matrix x = Matrix::Ones(n,1), p = Matrix::Ones(n,1), r = Matrix::Ones(n,1), z = Matrix::Ones(n,1), y;
+    real_t sink = 0;
+    const double t0 = wallTime();
+    for (index_t it=0; it<reps; ++it)
+    {
+        for (int pass=0; pass<2; ++pass)
+        {
+            y.setZero(n,1);
+            for (size_t k=0; k<B.size(); ++k)
+            {
+                Matrix w = B[k].transpose() * p;
+                y += B[k] * w;
+            }
+        }
+        sink += p.col(0).dot(y.col(0));
+        x += 1e-3 * p;
+        r -= 1e-3 * y;
+        sink += r.col(0).squaredNorm();
+        sink += r.col(0).dot(z.col(0));
+        p = z + 0.5 * p;
+    }
+    const double t = (wallTime() - t0) / reps;
+    if (sink != sink) gsWarn << "dualKernelTime: not a number\n";
+    return t;
+}
+
+//---------------------------------------------------------------------------
 // Distributed IETI-DP
 //---------------------------------------------------------------------------
 
@@ -1160,8 +1696,8 @@ struct OwnedPatch
 class IetiMpi
 {
 public:
-    IetiMpi(const Problem& P, Par& par, const Options& o, std::vector<index_t> mine)
-    : m_P(P), m_par(par), m_opt(o), m_mine(give(mine)), m_stats(new InnerStats), m_schurOp(*this), m_precOp(*this) {}
+    IetiMpi(const Problem& P, Par& par, const Options& o, std::vector<index_t> mine, const Dual& dual)
+    : m_P(P), m_par(par), m_opt(o), m_mine(give(mine)), m_dual(dual), m_stats(new InnerStats), m_schurOp(*this), m_precOp(*this) {}
 
     void setup(Timers& t);
 
@@ -1171,8 +1707,8 @@ public:
     public:
         explicit Schur(const IetiMpi& s) : m_s(s) {}
         void apply(const Matrix& x, Matrix& y) const { m_s.applySchur(x, y); }
-        index_t rows() const { return m_s.m_P.nLambda; }
-        index_t cols() const { return m_s.m_P.nLambda; }
+        index_t rows() const { return m_s.m_dual.nLocal; }
+        index_t cols() const { return m_s.m_dual.nLocal; }
     private:
         const IetiMpi& m_s;
     };
@@ -1183,8 +1719,8 @@ public:
     public:
         explicit Prec(const IetiMpi& s) : m_s(s) {}
         void apply(const Matrix& x, Matrix& y) const { m_s.applyPrec(x, y); }
-        index_t rows() const { return m_s.m_P.nLambda; }
-        index_t cols() const { return m_s.m_P.nLambda; }
+        index_t rows() const { return m_s.m_dual.nLocal; }
+        index_t cols() const { return m_s.m_dual.nLocal; }
     private:
         const IetiMpi& m_s;
     };
@@ -1244,6 +1780,7 @@ private:
     Par&                m_par;
     Options             m_opt;
     std::vector<index_t> m_mine;
+    const Dual&         m_dual;
     std::vector<OwnedPatch> m_patches;
     OpPtr               m_coarse;
     Matrix              m_fc;
@@ -1279,6 +1816,7 @@ void IetiMpi::setup(Timers& t)
         t.assembly += wallTime() - t0;
 
         t0 = wallTime();
+        raw.B = m_dual.rows(raw.B);
         OwnedPatch p;
         p.k = k;
         p.n = raw.A.rows();
@@ -1433,7 +1971,7 @@ void IetiMpi::setup(Timers& t)
     m_precLocalOp = m_precLocal.preconditioner();
 
     Matrix d;
-    d.setZero(m_P.nLambda, 1);
+    d.setZero(m_dual.nLocal, 1);
     for (size_t i=0; i<m_patches.size(); ++i)
     {
         const OwnedPatch& p = m_patches[i];
@@ -1452,7 +1990,7 @@ void IetiMpi::setup(Timers& t)
             d += p.B * (p.Psi * yl);
         }
     }
-    m_par.sum(d);
+    m_dual.accumulate(m_par, d);
     m_rhs = d;
     t.rhs += wallTime() - t0;
 }
@@ -1520,7 +2058,7 @@ void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj
 void IetiMpi::applySchur(const Matrix& x, Matrix& y) const
 {
     const index_t nPrimal = m_P.nPrimal;
-    y.setZero(m_P.nLambda, 1);
+    y.setZero(m_dual.nLocal, 1);
     Matrix g;
     g.setZero(nPrimal, 1);
 
@@ -1549,13 +2087,13 @@ void IetiMpi::applySchur(const Matrix& x, Matrix& y) const
             y += p.B * (p.Psi * yl);
         }
     }
-    m_par.sum(y);
+    m_dual.accumulate(m_par, y);
 }
 
 void IetiMpi::applyPrec(const Matrix& x, Matrix& y) const
 {
     m_precLocalOp->apply(x, y);
-    m_par.sum(y);
+    m_dual.accumulate(m_par, y);
 }
 
 std::vector<Matrix> IetiMpi::reconstruct(const Matrix& lambda) const
@@ -1591,6 +2129,64 @@ std::vector<Matrix> IetiMpi::reconstruct(const Matrix& lambda) const
         }
     }
     return u;
+}
+
+/// Result of cgDistributed
+struct CgInfo
+{
+    index_t iterations;
+    real_t  error, cond;
+};
+
+/// Preconditioned conjugate gradients with the inner products of the
+/// distributed multiplier layout. The recurrences, the stopping test
+/// (residual norm over right-hand side norm) and the Lanczos estimate of the
+/// condition number are those of gsConjugateGradient.
+CgInfo cgDistributed(const Op& A, const Op& M, const Dual& D, Par& par, const Matrix& rhs,
+                     Matrix& x, real_t tol, index_t maxIt)
+{
+    CgInfo info;
+    info.iterations = 0;
+    info.error = 0;
+    info.cond = -1;
+    std::vector<real_t> delta(1, 0), gamma;
+    const real_t rhsNorm = D.norm(par, rhs);
+    if (rhsNorm == 0)
+    {
+        x.setZero(rhs.rows(), 1);
+        return info;
+    }
+    Matrix tmp, update, res;
+    A.apply(x, tmp);
+    res = rhs - tmp;
+    info.error = D.norm(par, res) / rhsNorm;
+    if (info.error < tol) return info;
+    M.apply(res, update);
+    real_t absNew = D.dot(par, res, update);
+    while (info.iterations < maxIt)
+    {
+        ++info.iterations;
+        A.apply(update, tmp);
+        const real_t alpha = absNew / D.dot(par, update, tmp);
+        delta.back() += 1./alpha;
+        x   += alpha * update;
+        res -= alpha * tmp;
+        info.error = D.norm(par, res) / rhsNorm;
+        if (info.error < tol) break;
+        M.apply(res, tmp);
+        const real_t absOld = absNew;
+        absNew = D.dot(par, res, tmp);
+        const real_t beta = absNew / absOld;
+        update = tmp + beta * update;
+        gamma.push_back(-math::sqrt(beta)/alpha);
+        delta.push_back(beta/alpha);
+    }
+    if (info.error < tol)
+    {
+        gsLanczosMatrix<real_t> L(gamma, delta);
+        info.cond = L.maxEigenvalue()/L.minEigenvalue();
+    }
+    return info;
 }
 
 //---------------------------------------------------------------------------
@@ -1677,6 +2273,12 @@ int main(int argc, char* argv[])
     o.cost = "n2"; o.lcMethod = 1;
     o.setupOnly = false; o.emulateRanks = 0;
     o.coarse = "reduce"; o.coarseSolver = "lu"; o.coarseOn = "root";
+    o.multipliers = "replicated";
+#ifdef IETI_WITH_LINKCELL
+    o.dualNeighbours = "linkcell";
+#else
+    o.dualNeighbours = "mapper";
+#endif
     o.gateMult = 1e-10; o.gateL2 = 1e-8; o.gateComp = 1e-8;
     o.gateDirectL2 = 1e-8; o.gateDirectComp = 1e-8;
 
@@ -1709,7 +2311,11 @@ int main(int argc, char* argv[])
     cmd.addString("",  "coarse",    "Assembly of the coarse matrix: gather (triplets on all ranks) or reduce (pattern from the primal indices, one reduction of the values)", o.coarse);
     cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD ordering) or ldlt (SimplicialLDLT, AMD ordering)", o.coarseSolver);
     cmd.addString("",  "coarse-on", "Where the coarse matrix is factorized: root (rank 0, the coarse solutions are broadcast) or all (every rank)", o.coarseOn);
+    cmd.addString("",  "multipliers", "Multiplier vector: replicated (every rank holds all multipliers, one reduction per operator application) or distributed (a rank holds the multipliers of its patches, one neighbourhood exchange per operator application)", o.multipliers);
+    cmd.addString("",  "dual-neighbours", "Neighbour search of --multipliers=distributed: linkcell (halo cells and pair search over the own and the halo patches; needs GISMO_WITH_LINKCELL) or mapper (inverse of the global dof mapper over all patches)", o.dualNeighbours);
     try { cmd.getValues(argc, argv); } catch (int rv) { return rv; }
+    GISMO_ENSURE(o.multipliers == "replicated" || o.multipliers == "distributed",
+                 "--multipliers is replicated or distributed.");
     GISMO_ENSURE(o.coarseOn == "root" || o.coarseOn == "all", "--coarse-on is root or all.");
     o.coarseRoot = (o.coarseOn == "root");
     if (o.traction.empty()) o.traction = (o.dim==3) ? "0,0,-1" : "0,-1";
@@ -1752,9 +2358,29 @@ int main(int argc, char* argv[])
     buildPrimals(P, o, subset);
     tm.primals += wallTime() - t0;
     double t1 = wallTime();
-    buildJumps(P, subset);
+    // Patches of other ranks near the own ones (distributed multipliers)
+    std::vector<index_t> halo;
+    if (o.multipliers == "distributed")
+        halo = haloPatches(P, o, owner, par.rank, parts);
+    tm.dual += wallTime() - t1;
+    t1 = wallTime();
+    {
+        // The emulation of one rank reads the multipliers of the halo patches
+        std::vector<index_t> jumpSet = subset;
+        if (!jumpSet.empty() && o.emulateRanks > 0)
+        {
+            jumpSet.insert(jumpSet.end(), halo.begin(), halo.end());
+            std::sort(jumpSet.begin(), jumpSet.end());
+        }
+        buildJumps(P, jumpSet);
+    }
     tm.jumps += wallTime() - t1;
     tm.mapper += wallTime() - t0;
+    t1 = wallTime();
+    const Dual dual = buildDual(P, o, par, owner, mine, halo, status, failures);
+    tm.dual += wallTime() - t1;
+    if (par.maxOf((index_t)status) != 0 && status == 0)
+    { status = 1; failures += " dual-layout-on-another-rank"; }
 
     // Timing split of the setup (maximum over the ranks)
     struct SetupReport
@@ -1786,10 +2412,43 @@ int main(int argc, char* argv[])
     if (o.setupOnly && o.emulateRanks > 0)
     {
         SetupReport::print(par, o, P, tm, tPartition, mine.size(), "mapper");
-        return 0;
+        if (dual.distributed)
+        {
+            // Multiplier-vector arithmetic of this rank in both layouts
+            std::vector<JumpMatrix> Brep, Bloc;
+            for (size_t q=0; q<mine.size(); ++q)
+            {
+                std::vector<JumpMatrix> jm;
+                for (index_t r=0; r<P.dim; ++r) jm.push_back(P.mapper[r].jumpMatrix(mine[q]));
+                Brep.push_back(blockDiagonal(jm.begin(), jm.end()));
+                Bloc.push_back(dual.rows(Brep.back()));
+            }
+            const index_t reps = 20;
+            const double tRep = dualKernelTime(Brep, P.nLambda, reps);
+            const double tLoc = dualKernelTime(Bloc, dual.nLocal, reps);
+            std::ostringstream os;
+            os.precision(6);
+            os << "DUAL tag=" << (o.tag.empty() ? "-" : o.tag)
+               << " emulate=" << o.emulateRanks << " patches=" << P.nPatches << " owned=" << mine.size()
+               << " halo_patches=" << halo.size()
+               << " grid=" << P.grid[0] << "x" << P.grid[1] << "x" << P.grid[2]
+               << " degree=" << o.degree << " refine=" << o.refine
+               << " multipliers=" << P.nLambda << " primal=" << P.nPrimal
+               << " dual_neighbours=" << o.dualNeighbours
+               << " dual_local=" << dual.nLocal << " dual_owned=" << dual.nOwned
+               << " dual_shared=" << dual.nShared << " dual_nbr=" << dual.nNbr
+               << " t_dual=" << tm.dual
+               << " t_vec_replicated=" << tRep << " t_vec_distributed=" << tLoc
+               << " bytes_iter_replicated=" << 16.0*P.nLambda + 8.0*P.nPrimal
+               << " bytes_iter_distributed=" << 16.0*dual.nShared + 8.0*P.nPrimal + 24.0
+               << " status=" << (status ? "FAIL" : "PASS");
+            if (status) os << " failures=" << failures;
+            gsInfo << os.str() << "\n";
+        }
+        return status;
     }
 
-    IetiMpi ieti(P, par, o, mine);
+    IetiMpi ieti(P, par, o, mine, dual);
     ieti.setup(tm);
     if (o.setupOnly)
     {
@@ -1799,27 +2458,42 @@ int main(int argc, char* argv[])
 
     // Solve
     Matrix lambda;
-    lambda.setZero(P.nLambda, 1);
-    gsConjugateGradient<> PCG(memory::make_shared_not_owned(static_cast<Op*>(&ieti.schur())),
-                              memory::make_shared_not_owned(static_cast<Op*>(&ieti.prec())));
-    PCG.setCalcEigenvalues(true);
-    PCG.setTolerance(o.tol);
-    PCG.setMaxIterations(o.maxIt);
-    Matrix hist;
+    lambda.setZero(dual.nLocal, 1);
+    index_t iterations = 0;
+    bool converged = false;
+    real_t cond = -1;
     par.commTime = 0; par.commCalls = 0; par.commBytes = 0;
     t0 = wallTime();
-    PCG.solveDetailed(ieti.rhs(), lambda, hist);
+    if (dual.distributed)
+    {
+        const CgInfo ci = cgDistributed(ieti.schur(), ieti.prec(), dual, par, ieti.rhs(), lambda, o.tol, o.maxIt);
+        iterations = ci.iterations;
+        converged  = ci.error < o.tol;
+        cond       = ci.cond;
+    }
+    else
+    {
+        gsConjugateGradient<> PCG(memory::make_shared_not_owned(static_cast<Op*>(&ieti.schur())),
+                                  memory::make_shared_not_owned(static_cast<Op*>(&ieti.prec())));
+        PCG.setCalcEigenvalues(true);
+        PCG.setTolerance(o.tol);
+        PCG.setMaxIterations(o.maxIt);
+        Matrix hist;
+        PCG.solveDetailed(ieti.rhs(), lambda, hist);
+        iterations = hist.rows()-1;
+        converged  = hist(iterations,0) < o.tol;
+        cond       = PCG.getConditionNumber();
+    }
     const double tSolve = wallTime() - t0;
     tm.solve = tSolve;
     const double commSolve = par.commTime;
-    const index_t iterations = hist.rows()-1;
-    const bool converged = hist(iterations,0) < o.tol;
-    const real_t cond = PCG.getConditionNumber();
+    const double commBytesSolve = par.commBytes;
+    const index_t commCallsSolve = par.commCalls;
 
     // True relative residual of the multiplier system
     Matrix Fl;
     ieti.schur().apply(lambda, Fl);
-    const real_t relRes = (ieti.rhs() - Fl).norm() / ieti.rhs().norm();
+    const real_t relRes = dual.norm(par, ieti.rhs() - Fl) / dual.norm(par, ieti.rhs());
 
     std::vector<Matrix> u = ieti.reconstruct(lambda);
     const real_t compliance = ieti.compliance(u);
@@ -1852,7 +2526,7 @@ int main(int argc, char* argv[])
         Reference ref;
         libraryReference(P, o, ref);
         Matrix Fref;
-        ref.schur->apply(lambda, Fref);
+        ref.schur->apply(dual.global(par, lambda), Fref);
         chkMult = (Fref - ref.rhs).norm() / ref.rhs.norm();
 
         Matrix part(2,1);
@@ -1961,7 +2635,11 @@ int main(int argc, char* argv[])
     tMax.primals = par.maxOf(tm.primals); tMax.jumps = par.maxOf(tm.jumps);
     tMax.wait = par.maxOf(tm.wait); tMax.cassemble = par.maxOf(tm.cassemble);
     tMax.cfactor = par.maxOf(tm.cfactor);
-    const double nCalls   = (double)par.maxOf((index_t)par.commCalls);
+    const double nCalls   = (double)par.maxOf(commCallsSolve);
+    const double commBytes = par.maxOf(commBytesSolve);
+    const index_t dualLocal = par.maxOf(dual.nLocal), dualShared = par.maxOf(dual.nShared),
+                  dualNbr = par.maxOf(dual.nNbr);
+    const double tDual = par.maxOf(tm.dual);
     const real_t condMax  = cond;
     const double dirCalls = par.sumOf(ieti.stats().dirCalls), dirIters = par.sumOf(ieti.stats().dirIters),
                  conCalls = par.sumOf(ieti.stats().conCalls), conIters = par.sumOf(ieti.stats().conIters);
@@ -2017,6 +2695,13 @@ int main(int argc, char* argv[])
            << " t_total=" << tTotal
            << " t_comm=" << tComm
            << " comm_calls=" << nCalls
+           << " comm_bytes=" << commBytes
+           << " multiplier_layout=" << o.multipliers
+           << " dual_neighbours=" << (dual.distributed ? o.dualNeighbours : std::string("-"))
+           << " dual_local=" << dualLocal
+           << " dual_shared=" << dualShared
+           << " dual_nbr=" << dualNbr
+           << " t_dual=" << tDual
            << " local_solver=" << o.localSolver
            << " inner_dir_calls=" << dirCalls
            << " inner_dir_iters=" << dirIters
