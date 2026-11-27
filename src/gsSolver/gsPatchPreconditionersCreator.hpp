@@ -21,6 +21,8 @@
 #include <gsAssembler/gsQuadrature.h>
 #include <gsNurbs/gsTensorBSplineBasis.h>
 
+#include <algorithm>
+
 namespace gismo
 {
 
@@ -388,6 +390,546 @@ std::vector< gsSparseMatrix<T> > assembleTensorStiffness(
     return result;
 }
 
+// Banded square matrix with the half bandwidth p; the entry (i,i+o-p) is
+// stored at v[i*(2p+1)+o]
+template<typename T>
+struct lowRankBanded
+{
+    index_t n, p;
+    std::vector<T> v;
+
+    lowRankBanded() : n(0), p(0) {}
+    lowRankBanded(index_t n_, index_t p_) : n(n_), p(p_), v(n_*(2*p_+1), (T)(0)) {}
+
+    T& at(index_t i, index_t o)       { return v[i*(2*p+1)+o]; }
+    T  at(index_t i, index_t o) const { return v[i*(2*p+1)+o]; }
+
+    lowRankBanded transposed() const
+    {
+        lowRankBanded result(n,p);
+        for ( index_t i=0; i<n; ++i )
+            for ( index_t o=0; o<=2*p; ++o )
+            {
+                const index_t j = i+o-p;
+                if (j >= 0 && j < n)
+                    result.at(j,2*p-o) = at(i,o);
+            }
+        return result;
+    }
+
+    // y += this applied along the direction m of a tensor with the sizes sz,
+    // where the first direction runs fastest
+    void applyAlong(index_t m, const std::vector<index_t>& sz, const T* x, T* y) const
+    {
+        index_t stride = 1, outer = 1;
+        for ( index_t j=0; j<m; ++j )
+            stride *= sz[j];
+        for ( index_t j=m+1; j<(index_t)sz.size(); ++j )
+            outer *= sz[j];
+        for ( index_t l=0; l<outer; ++l )
+            for ( index_t i=0; i<n; ++i )
+            {
+                T* yi = y + (l*n+i)*stride;
+                for ( index_t o=0; o<=2*p; ++o )
+                {
+                    const index_t j = i+o-p;
+                    const T b = at(i,o);
+                    if (j < 0 || j >= n || b == (T)(0))
+                        continue;
+                    const T* xj = x + (l*n+j)*stride;
+                    for ( index_t t=0; t<stride; ++t )
+                        yi[t] += b * xj[t];
+                }
+            }
+    }
+};
+
+// Banded univariate matrix with the entries
+//   sum_q sqw[q] coef[q*stride] f_i(nodes[q]) g_j(nodes[q]),
+// where sqw are the square roots of the quadrature weights, f_i are the test
+// and g_j the trial functions, each a basis function or its derivative
+template<typename T>
+lowRankBanded<T> assembleLowRankFactor(const univariateQuadrature<T>& qu,
+                                       const gsVector<T>& sqw,
+                                       const T* coef, index_t stride,
+                                       bool derivTest, bool derivTrial, index_t sz)
+{
+    const gsMatrix<T>& f = derivTest  ? qu.derivs : qu.values;
+    const gsMatrix<T>& g = derivTrial ? qu.derivs : qu.values;
+    const index_t K = f.rows(), p = K-1;
+    lowRankBanded<T> result(sz,p);
+    for ( index_t q=0; q<f.cols(); ++q )
+    {
+        const T w = sqw[q] * coef[q*stride];
+        if (w == (T)(0))
+            continue;
+        for ( index_t a=0; a<K; ++a )
+        {
+            const index_t i = qu.actives(a,q);
+            const T wa = w * f(a,q);
+            for ( index_t b=0; b<K; ++b )
+                result.at(i,qu.actives(b,q)-i+p) += wa * g(b,q);
+        }
+    }
+    return result;
+}
+
+// Tensor train SVD of the tensor x (first index fastest, overwritten) with
+// the sizes sz and the absolute tolerance tol. The core m is stored in
+// cores[m] with the entry (a,q,b) at a + ranks[m]*(q + sz[m]*b), where
+// ranks[0] = ranks[d] = 1. Returns false if the tensor is truncated to zero.
+template<typename T>
+bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
+                    std::vector< std::vector<T> >& cores, std::vector<index_t>& ranks)
+{
+    typedef gsEigen::Matrix<T,Dynamic,Dynamic> Matrix;
+    const index_t d = (index_t)sz.size();
+    cores.resize(d);
+    ranks.assign(d+1,1);
+    const T tol2 = tol * tol / (T)(d > 1 ? d-1 : 1);
+    index_t total = (index_t)x.size();
+    for ( index_t m=0; m+1<d; ++m )
+    {
+        const index_t rows = ranks[m] * sz[m], cols = total / sz[m];
+        gsEigen::Map<Matrix> unfolding(x.data(), rows, cols);
+        // For a wide unfolding X, the SVD of X^T = Q R is computed from the
+        // SVD of the small factor R^T = U S W^T, so X = U S (Q W)^T
+        Matrix U, V;
+        gsEigen::Matrix<T,Dynamic,1> s;
+        if (rows < cols)
+        {
+            gsEigen::HouseholderQR<Matrix> qr(unfolding.transpose());
+            const Matrix Rt = qr.matrixQR().topRows(rows).template triangularView<gsEigen::Upper>().transpose();
+            gsEigen::JacobiSVD<Matrix> svd(Rt, gsEigen::ComputeFullU | gsEigen::ComputeFullV);
+            U = svd.matrixU();
+            s = svd.singularValues();
+            V = Matrix::Zero(cols, rows);
+            V.topRows(rows) = svd.matrixV();
+            V.applyOnTheLeft(qr.householderQ());
+        }
+        else
+        {
+            gsEigen::BDCSVD<Matrix> svd(unfolding, gsEigen::ComputeThinU | gsEigen::ComputeThinV);
+            U = svd.matrixU();
+            s = svd.singularValues();
+            V = svd.matrixV();
+        }
+        index_t r = s.rows();
+        T tail = 0;
+        while ( r > 0 && tail + s[r-1]*s[r-1] <= tol2 )
+        {
+            tail += s[r-1]*s[r-1];
+            --r;
+        }
+        if (r == 0)
+            return false;
+        cores[m].assign(U.data(), U.data() + rows*r);
+        const Matrix rest = s.head(r).asDiagonal() * V.leftCols(r).transpose();
+        x.assign(rest.data(), rest.data() + rest.size());
+        total = cols;
+        ranks[m+1] = r;
+    }
+    cores[d-1] = x;
+    return true;
+}
+
+// One coefficient function as a sum of Kronecker products in the block of
+// the test component e and the trial component c. factors[m][a*ranks[m+1]+b]
+// is the univariate matrix of the direction m.
+template<typename T>
+struct lowRankTerm
+{
+    index_t e, c;
+    std::vector<index_t> ranks;
+    std::vector< std::vector< lowRankBanded<T> > > factors;
+
+    lowRankTerm transposed() const
+    {
+        lowRankTerm result(*this);
+        std::swap(result.e, result.c);
+        for ( size_t m=0; m<factors.size(); ++m )
+            for ( size_t i=0; i<factors[m].size(); ++i )
+                result.factors[m][i] = factors[m][i].transposed();
+        return result;
+    }
+};
+
+// Low rank representation of the elasticity stiffness matrix of a patch
+template<typename T>
+struct lowRankElasticity
+{
+    index_t d, N;
+    std::vector<index_t> sz, deg;                  // univariate sizes and degrees
+    std::vector< lowRankTerm<T> > terms;
+    std::vector< std::vector<index_t> > dofs;      // dofs[c][I]: unknown or -1
+
+    index_t tensorSize() const
+    {
+        index_t result = 1;
+        for ( index_t m=0; m<d; ++m )
+            result *= sz[m];
+        return result;
+    }
+
+    // y[e] += sum of the terms of the blocks (e,c) applied to x[c]
+    void apply(const std::vector< std::vector<T> >& x, std::vector< std::vector<T> >& y) const
+    {
+        const index_t n = tensorSize();
+        std::vector< std::vector<T> > cur, next;
+        for ( size_t i=0; i<terms.size(); ++i )
+        {
+            const lowRankTerm<T>& t = terms[i];
+            next.assign(t.ranks[d-1], std::vector<T>(n,(T)(0)));
+            for ( index_t a=0; a<t.ranks[d-1]; ++a )
+                t.factors[d-1][a].applyAlong(d-1, sz, x[t.c].data(), next[a].data());
+            for ( index_t m=d-2; m>=0; --m )
+            {
+                cur.swap(next);
+                next.assign(t.ranks[m], std::vector<T>(n,(T)(0)));
+                for ( index_t a=0; a<t.ranks[m]; ++a )
+                    for ( index_t b=0; b<t.ranks[m+1]; ++b )
+                        t.factors[m][a*t.ranks[m+1]+b].applyAlong(m, sz, cur[b].data(), next[a].data());
+            }
+            std::vector<T>& ye = y[t.e];
+            for ( index_t j=0; j<n; ++j )
+                ye[j] += next[0][j];
+        }
+    }
+
+    // Adds the term to the band tensor out, which has the entry of the row
+    // I = i_0 + n_0 (i_1 + ...) and the offsets o_0, ..., o_{d-1} at
+    // I*W + o_{d-1} + w_{d-1} (o_{d-2} + w_{d-2} (...))
+    void addToBand(const lowRankTerm<T>& t, std::vector<T>& out) const
+    {
+        std::vector< std::vector<T> > Q(t.ranks[d-1]), Qn;
+        index_t Nr = sz[d-1], Wr = 2*t.factors[d-1][0].p+1;
+        for ( index_t a=0; a<t.ranks[d-1]; ++a )
+            Q[a] = t.factors[d-1][a].v;
+        for ( index_t m=d-2; m>=0; --m )
+        {
+            const index_t nm = sz[m], wm = 2*t.factors[m][0].p+1, Wn = wm*Wr;
+            Qn.assign(m == 0 ? 0 : t.ranks[m], std::vector<T>());
+            for ( index_t a=0; a<t.ranks[m]; ++a )
+            {
+                std::vector<T>& dst = (m == 0) ? out : Qn[a];
+                if (m != 0)
+                    dst.assign(nm*Nr*Wn, (T)(0));
+                for ( index_t b=0; b<t.ranks[m+1]; ++b )
+                {
+                    const lowRankBanded<T>& B = t.factors[m][a*t.ranks[m+1]+b];
+                    const std::vector<T>& q = Q[b];
+                    for ( index_t Ir=0; Ir<Nr; ++Ir )
+                        for ( index_t i=0; i<nm; ++i )
+                        {
+                            T* row = dst.data() + (i+nm*Ir)*Wn;
+                            const T* qr = q.data() + Ir*Wr;
+                            for ( index_t o=0; o<wm; ++o )
+                            {
+                                const T bv = B.at(i,o);
+                                if (bv == (T)(0))
+                                    continue;
+                                T* ro = row + o*Wr;
+                                for ( index_t D=0; D<Wr; ++D )
+                                    ro[D] += bv * qr[D];
+                            }
+                        }
+                }
+            }
+            Q.swap(Qn);
+            Nr *= nm;
+            Wr = Wn;
+        }
+    }
+
+    gsSparseMatrix<T> matrix() const
+    {
+        const index_t n = tensorSize();
+        std::vector<index_t> w(d);
+        index_t W = 1;
+        for ( index_t m=0; m<d; ++m )
+        {
+            w[m] = 2*deg[m]+1;
+            W *= w[m];
+        }
+        std::vector< std::vector<T> > band(d*d);
+        for ( size_t i=0; i<terms.size(); ++i )
+        {
+            std::vector<T>& bd = band[terms[i].e*d+terms[i].c];
+            if (bd.empty())
+                bd.assign(n*W, (T)(0));
+            addToBand(terms[i], bd);
+        }
+
+        std::vector< std::pair<index_t,index_t> > owner(N);
+        for ( index_t c=0; c<d; ++c )
+            for ( index_t I=0; I<n; ++I )
+                if (dofs[c][I] >= 0)
+                    owner[dofs[c][I]] = std::make_pair(c,I);
+
+        // The matrix is symmetric, so the column (c,J) is the row (c,J)
+        gsSparseMatrix<T> result(N,N);
+        result.reserve(N*d*W);
+        std::vector< std::pair<index_t,T> > col;
+        std::vector<index_t> idx(d);
+        for ( index_t g=0; g<N; ++g )
+        {
+            const index_t c = owner[g].first, J = owner[g].second;
+            index_t rem = J;
+            for ( index_t m=0; m<d; ++m )
+            {
+                idx[m] = rem % sz[m];
+                rem /= sz[m];
+            }
+            col.clear();
+            for ( index_t e=0; e<d; ++e )
+            {
+                const std::vector<T>& bd = band[c*d+e];
+                if (bd.empty())
+                    continue;
+                for ( index_t D=0; D<W; ++D )
+                {
+                    index_t Dr = D, I = 0;
+                    bool inside = true;
+                    for ( index_t m=d-1; m>=0 && inside; --m )
+                    {
+                        const index_t j = idx[m] + Dr % w[m] - (w[m]-1)/2;
+                        Dr /= w[m];
+                        inside = (j >= 0 && j < sz[m]);
+                        I = I * sz[m] + j;
+                    }
+                    if (inside && dofs[e][I] >= 0)
+                        col.push_back(std::make_pair(dofs[e][I], bd[J*W+D]));
+                }
+            }
+            std::sort(col.begin(), col.end());
+            result.startVec(g);
+            for ( size_t k=0; k<col.size(); ++k )
+                result.insertBack(col[k].first, g) = col[k].second;
+        }
+        result.finalize();
+        return result;
+    }
+};
+
+template<typename T>
+class lowRankElasticityOp : public gsLinearOperator<T>
+{
+public:
+    explicit lowRankElasticityOp(const lowRankElasticity<T>& lr) : m_lr(lr) {}
+
+    void apply(const gsMatrix<T>& input, gsMatrix<T>& x) const
+    {
+        const index_t d = m_lr.d, n = m_lr.tensorSize();
+        x.setZero(m_lr.N, input.cols());
+        std::vector< std::vector<T> > in(d, std::vector<T>(n)), out(d, std::vector<T>(n));
+        for ( index_t k=0; k<input.cols(); ++k )
+        {
+            for ( index_t c=0; c<d; ++c )
+                for ( index_t I=0; I<n; ++I )
+                {
+                    const index_t g = m_lr.dofs[c][I];
+                    in[c][I] = g < 0 ? (T)(0) : input(g,k);
+                    out[c][I] = 0;
+                }
+            m_lr.apply(in, out);
+            for ( index_t c=0; c<d; ++c )
+                for ( index_t I=0; I<n; ++I )
+                {
+                    const index_t g = m_lr.dofs[c][I];
+                    if (g >= 0)
+                        x(g,k) = out[c][I];
+                }
+        }
+    }
+
+    index_t rows() const { return m_lr.N; }
+    index_t cols() const { return m_lr.N; }
+
+private:
+    lowRankElasticity<T> m_lr;
+};
+
+// Sets up the low rank representation of the elasticity stiffness matrix
+template<typename T>
+void setupLowRankElasticity(const gsBasis<T>& basis,
+                            const gsGeometry<T>& geo,
+                            const std::vector< gsBoundaryConditions<T> >& bc,
+                            const gsOptionList& opt,
+                            T lambda, T mu, T tol,
+                            lowRankElasticity<T>& result)
+{
+    const index_t d = basis.dim();
+    GISMO_ASSERT ( geo.domainDim() == d && geo.targetDim() == d,
+        "gsPatchPreconditionersCreator: geometry and basis do not fit." );
+    GISMO_ASSERT ( (index_t)bc.size() == d,
+        "gsPatchPreconditionersCreator: needs boundary conditions for each component." );
+    GISMO_ENSURE ( (dirichlet::strategy)opt.askInt("DirichletStrategy",dirichlet::elimination) == dirichlet::elimination,
+        "gsPatchPreconditionersCreator: only the elimination of Dirichlet conditions is supported." );
+
+    GISMO_ASSERT ( d >= 2, "gsPatchPreconditionersCreator: needs a basis of dimension 2 or more." );
+
+    result.d = d;
+    result.sz.resize(d);
+    result.deg.resize(d);
+    std::vector< univariateQuadrature<T> > qu(d);
+    std::vector< gsVector<T> > sqw(d);
+    std::vector<index_t> nq(d);
+    index_t ntot = 1;
+    for ( index_t m=0; m<d; ++m )
+    {
+        setupUnivariateQuadrature(basis.component(m), opt, qu[m]);
+        sqw[m] = qu[m].weights.array().sqrt();
+        result.sz[m] = basis.component(m).size();
+        result.deg[m] = qu[m].actives.rows()-1;
+        nq[m] = qu[m].weights.rows();
+        ntot *= nq[m];
+    }
+
+    // Unknowns: per component, the sides with Dirichlet conditions are eliminated
+    const index_t n = result.tensorSize();
+    result.dofs.assign(d, std::vector<index_t>(n,-1));
+    index_t offset = 0;
+    std::vector<index_t> lo(d), hi(d), idx(d);
+    for ( index_t c=0; c<d; ++c )
+    {
+        for ( index_t m=0; m<d; ++m )
+        {
+            const gsBoundaryConditions<T> bcm = boundaryConditionsForDirection(bc[c],m);
+            const boundary_condition<T>* west = bcm.getConditionFromSide( patchSide(0,boundary::west) );
+            const boundary_condition<T>* east = bcm.getConditionFromSide( patchSide(0,boundary::east) );
+            lo[m] = (west && west->type() == condition_type::dirichlet) ? 1 : 0;
+            hi[m] = result.sz[m] - ((east && east->type() == condition_type::dirichlet) ? 1 : 0);
+        }
+        for ( index_t I=0; I<n; ++I )
+        {
+            index_t rem = I;
+            bool free = true;
+            for ( index_t m=0; m<d; ++m )
+            {
+                const index_t i = rem % result.sz[m];
+                rem /= result.sz[m];
+                free = free && i >= lo[m] && i < hi[m];
+            }
+            if (free)
+                result.dofs[c][I] = offset++;
+        }
+    }
+    result.N = offset;
+
+    // |det J| and J^{-1} on the tensor grid of the quadrature nodes
+    std::vector<T> detJ(ntot), Jinv(ntot*d*d);
+    {
+        const index_t chunk = 16384;
+        gsMatrix<T> pts, jacs, J, Ji;
+        T sign = 0;
+        for ( index_t s=0; s<ntot; s+=chunk )
+        {
+            const index_t len = math::min(chunk, ntot-s);
+            pts.resize(d,len);
+            for ( index_t i=0; i<len; ++i )
+            {
+                index_t rem = s+i;
+                for ( index_t m=0; m<d; ++m )
+                {
+                    pts(m,i) = qu[m].nodes(0, rem % nq[m]);
+                    rem /= nq[m];
+                }
+            }
+            geo.jacobian_into(pts, jacs);
+            for ( index_t i=0; i<len; ++i )
+            {
+                J = jacs.block(0, i*d, d, d);
+                const T det = J.determinant();
+                if (sign == 0)
+                    sign = det > 0 ? 1 : -1;
+                GISMO_ENSURE ( sign * det > 0,
+                    "gsPatchPreconditionersCreator: the geometry map is not regular at a quadrature node." );
+                detJ[s+i] = sign * det;
+                Ji = J.inverse();
+                for ( index_t a=0; a<d; ++a )
+                    for ( index_t b=0; b<d; ++b )
+                        Jinv[(s+i)*d*d + a + d*b] = Ji(a,b);
+            }
+        }
+    }
+
+    // The coefficient functions A^{ce}_{kl} with e>c, or e==c and k<=l; the
+    // others are their transposes
+    struct coefIndex { index_t c, e, k, l; };
+    std::vector<coefIndex> fs;
+    for ( index_t c=0; c<d; ++c )
+        for ( index_t e=c; e<d; ++e )
+            for ( index_t k=0; k<d; ++k )
+                for ( index_t l=(e == c ? k : 0); l<d; ++l )
+                {
+                    const coefIndex ci = {c, e, k, l};
+                    fs.push_back(ci);
+                }
+
+    std::vector< std::vector<T> > values(fs.size(), std::vector<T>(ntot));
+    std::vector<T> norms(fs.size());
+    T maxNorm = 0;
+    for ( size_t f=0; f<fs.size(); ++f )
+    {
+        const coefIndex& ci = fs[f];
+        std::vector<T>& v = values[f];
+        for ( index_t q=0; q<ntot; ++q )
+        {
+            const T* Ji = &Jinv[q*d*d];
+            T metric = 0;
+            if (ci.c == ci.e)
+                for ( index_t j=0; j<d; ++j )
+                    metric += Ji[ci.k+d*j] * Ji[ci.l+d*j];
+            const T a = lambda * Ji[ci.k+d*ci.c] * Ji[ci.l+d*ci.e]
+                      + mu * metric
+                      + mu * Ji[ci.k+d*ci.e] * Ji[ci.l+d*ci.c];
+            index_t rem = q;
+            T w = 1;
+            for ( index_t m=0; m<d; ++m )
+            {
+                w *= sqw[m][rem % nq[m]];
+                rem /= nq[m];
+            }
+            v[q] = detJ[q] * a * w;
+        }
+        T s = 0;
+        for ( index_t q=0; q<ntot; ++q )
+            s += v[q] * v[q];
+        norms[f] = math::sqrt(s);
+        maxNorm = math::max(maxNorm, norms[f]);
+    }
+    std::vector<T>().swap(Jinv);
+
+    const T abstol = tol * maxNorm;
+    result.terms.clear();
+    std::vector< std::vector<T> > cores;
+    std::vector<index_t> ranks;
+    for ( size_t f=0; f<fs.size(); ++f )
+    {
+        if (norms[f] <= abstol)
+            continue;
+        const bool nonzero = tensorTrainSvd(values[f], nq, abstol, cores, ranks);
+        std::vector<T>().swap(values[f]);
+        if (!nonzero)
+            continue;
+        const coefIndex& ci = fs[f];
+        lowRankTerm<T> t;
+        t.e = ci.e;
+        t.c = ci.c;
+        t.ranks = ranks;
+        t.factors.resize(d);
+        for ( index_t m=0; m<d; ++m )
+            for ( index_t a=0; a<ranks[m]; ++a )
+                for ( index_t b=0; b<ranks[m+1]; ++b )
+                    t.factors[m].push_back( assembleLowRankFactor(qu[m], sqw[m],
+                        cores[m].data() + a + ranks[m]*nq[m]*b, ranks[m],
+                        m == ci.l, m == ci.k, result.sz[m]) );
+        if (ci.e != ci.c || ci.k != ci.l)
+            result.terms.push_back(t.transposed());
+        result.terms.push_back(t);
+    }
+}
+
 } // anonymous namespace
 
 template<typename T>
@@ -654,6 +1196,72 @@ typename gsPatchPreconditionersCreator<T>::OpUPtr gsPatchPreconditionersCreator<
             fastDiagonalization(basis, bc[c], opt, 0, beta, 0) );
     }
     return result;
+}
+
+template<typename T>
+gsSparseMatrix<T> gsPatchPreconditionersCreator<T>::elasticityLowRankMatrix(
+    const gsBasis<T>& basis,
+    const gsGeometry<T>& geo,
+    const std::vector< gsBoundaryConditions<T> >& bc,
+    const gsOptionList& opt,
+    T lambda,
+    T mu,
+    T tol
+    )
+{
+    lowRankElasticity<T> lr;
+    setupLowRankElasticity(basis, geo, bc, opt, lambda, mu, tol, lr);
+    return lr.matrix();
+}
+
+template<typename T>
+gsSparseMatrix<T> gsPatchPreconditionersCreator<T>::elasticityLowRankMatrix(
+    const gsBasis<T>& basis,
+    const gsGeometry<T>& geo,
+    const gsBoundaryConditions<T>& bc,
+    const gsOptionList& opt,
+    T lambda,
+    T mu,
+    T tol
+    )
+{
+    std::vector< gsBoundaryConditions<T> > bcs;
+    for ( index_t c=0; c<basis.dim(); ++c )
+        bcs.push_back( boundaryConditionsForComponent(bc,(short_t)c) );
+    return elasticityLowRankMatrix(basis, geo, bcs, opt, lambda, mu, tol);
+}
+
+template<typename T>
+typename gsPatchPreconditionersCreator<T>::OpUPtr gsPatchPreconditionersCreator<T>::elasticityLowRankOp(
+    const gsBasis<T>& basis,
+    const gsGeometry<T>& geo,
+    const std::vector< gsBoundaryConditions<T> >& bc,
+    const gsOptionList& opt,
+    T lambda,
+    T mu,
+    T tol
+    )
+{
+    lowRankElasticity<T> lr;
+    setupLowRankElasticity(basis, geo, bc, opt, lambda, mu, tol, lr);
+    return OpUPtr( new lowRankElasticityOp<T>(lr) );
+}
+
+template<typename T>
+typename gsPatchPreconditionersCreator<T>::OpUPtr gsPatchPreconditionersCreator<T>::elasticityLowRankOp(
+    const gsBasis<T>& basis,
+    const gsGeometry<T>& geo,
+    const gsBoundaryConditions<T>& bc,
+    const gsOptionList& opt,
+    T lambda,
+    T mu,
+    T tol
+    )
+{
+    std::vector< gsBoundaryConditions<T> > bcs;
+    for ( index_t c=0; c<basis.dim(); ++c )
+        bcs.push_back( boundaryConditionsForComponent(bc,(short_t)c) );
+    return elasticityLowRankOp(basis, geo, bcs, opt, lambda, mu, tol);
 }
 
 template<typename T>
