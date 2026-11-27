@@ -1208,9 +1208,36 @@ Dual buildDual(const Problem& P, const Options& o, Par& par, const std::vector<i
         partners = partnersLinkcell(P, owner, rank, halo);
         if (o.check || o.checkTopology)
         {
-            // The pair search must find the couplings of the dof mapper
-            if (!(partners == partnersMapper(P, owner, rank)))
+            // The pair search must find the couplings of the dof mapper, on
+            // every rank: the counts are summed, so that rank 0 reports a
+            // mismatch of any rank, and each rank with a mismatch prints it.
+            const std::vector<Partner> ref = partnersMapper(P, owner, rank);
+            std::vector<Partner> missing, extra;
+            std::set_difference(ref.begin(), ref.end(), partners.begin(), partners.end(),
+                                std::back_inserter(missing));
+            std::set_difference(partners.begin(), partners.end(), ref.begin(), ref.end(),
+                                std::back_inserter(extra));
+            const std::vector<index_t> refHalo = haloPatchesMapper(P, owner, rank);
+            std::vector<index_t> haloMissing;
+            std::set_difference(refHalo.begin(), refHalo.end(), halo.begin(), halo.end(),
+                                std::back_inserter(haloMissing));
+            if (!missing.empty() || !extra.empty() || !haloMissing.empty())
+            {
+                std::cout << "# dual-partners rank=" << rank << " missing=" << missing.size()
+                          << " extra=" << extra.size() << " halo=" << halo.size()
+                          << " halo_missing=" << haloMissing.size();
+                if (!haloMissing.empty())
+                    std::cout << " first_halo_missing=" << haloMissing[0]
+                              << " owner=" << owner[haloMissing[0]];
+                if (!missing.empty())
+                    std::cout << " first_missing=" << missing[0].k << ":" << missing[0].i
+                              << ":" << missing[0].other;
+                std::cout << std::endl;
+            }
+            if (par.sumOf((double)(missing.size() + extra.size())) > 0)
             { status = 1; failures += " dual-partners"; }
+            if (par.sumOf((double)haloMissing.size()) > 0)
+            { status = 1; failures += " dual-halo"; }
         }
     }
     else
@@ -2348,6 +2375,17 @@ int main(int argc, char* argv[])
     const int parts = o.emulateRanks > 0 ? (int)o.emulateRanks : par.size;
     const std::vector<int> owner = ownerOf(P, o, parts);
     const double tPartition = wallTime() - tPart0;
+    if (o.checkTopology)
+    {
+        // Every rank computes the partition itself; all must hold the same one
+        double sig = 0;
+        for (size_t k=0; k<owner.size(); ++k) sig += (double)(k+1) * (double)(owner[k]+1);
+        if (par.maxOf(sig) != -par.maxOf(-sig))
+        {
+            status = 1; failures += " owner-differs";
+            std::cout << "# owner-differs rank=" << par.rank << " signature=" << sig << std::endl;
+        }
+    }
     const PartStats pst = partitionStats(P, owner, parts);
     GISMO_ENSURE(pst.minPatches > 0, "Partition leaves a rank without patches.");
     std::vector<index_t> mine = distribute(owner, par.rank);
