@@ -259,6 +259,119 @@ public:
         const gsGeometry<T>* geo = NULL
     );
 
+    /// Provides the stiffness matrix of linear elasticity on a single patch,
+    /// assembled from a low rank tensor approximation of the geometry
+    /// coefficients (CMAME 316, p. 1062 - 1085, 2017)
+    ///
+    /// The bilinear form is
+    /// \f$ 2 \mu (\varepsilon(u), \varepsilon(v))_{L_2} + \lambda (\nabla\cdot u, \nabla\cdot v)_{L_2} \f$
+    /// on the physical domain. On the parameter domain, the block of the
+    /// trial component \f$ c \f$ and the test component \f$ e \f$ reads
+    /// \f$ \sum_{k,l} (A^{ce}_{kl} \partial_k u_c, \partial_l v_e)_{L_2} \f$ with
+    /// \f$ A^{ce}_{kl} = |\det J| ( \lambda J^{-1}_{kc} J^{-1}_{le} + \mu \delta_{ce} (J^{-1} J^{-\top})_{kl} + \mu J^{-1}_{ke} J^{-1}_{lc} ) \f$,
+    /// where \f$ J \f$ is the Jacobian of the geometry map. Each coefficient
+    /// function, multiplied with the square roots of the quadrature weights,
+    /// is sampled on the tensor grid of the quadrature nodes given by \a opt
+    /// and compressed by a tensor train SVD (SIAM J. Sci. Comput., 33 (5),
+    /// p. 2295 - 2317, 2011) with the absolute tolerance \a tol times the
+    /// largest norm of the sampled coefficient functions. A term with the
+    /// tensor train ranks \f$ r_1, \dots, r_{d-1} \f$ is a sum of
+    /// \f$ r_1 \cdots r_{d-1} \f$ Kronecker products of weighted univariate
+    /// mass, stiffness and mixed matrices. The matrix is the sum of these
+    /// Kronecker products, so the cost of the assembly depends on the ranks
+    /// and not on the number of quadrature nodes per element.
+    ///
+    /// If the tensor train SVD keeps all singular values, the result agrees
+    /// with the matrix assembled element by element with the same
+    /// quadrature rule up to rounding errors. For a constant Jacobian, all
+    /// ranks are one.
+    ///
+    /// The unknowns are ordered component by component; within each
+    /// component, the unknowns on the sides with Dirichlet conditions for
+    /// that component are eliminated and the others keep their tensor
+    /// order. This is the ordering of \a gsElasticityAssembler and of the
+    /// vector valued spaces of \a gsExprAssembler with Dirichlet conditions
+    /// given on whole sides.
+    ///
+    /// \param basis   A tensor basis (of one displacement component)
+    /// \param geo     Geometry map of the patch
+    /// \param bc      Boundary conditions for each component
+    /// \param opt     Assembler options (quadrature rule)
+    /// \param lambda  First Lame parameter
+    /// \param mu      Second Lame parameter (shear modulus)
+    /// \param tol     Relative tolerance of the tensor train SVD
+    static gsSparseMatrix<T> elasticityLowRankMatrix(
+        const gsBasis<T>& basis,
+        const gsGeometry<T>& geo,
+        const std::vector< gsBoundaryConditions<T> >& bc,
+        const gsOptionList& opt,
+        T lambda,
+        T mu,
+        T tol = (T)(1e-10)
+    );
+
+    /// Provides the stiffness matrix of linear elasticity on a single patch,
+    /// assembled from a low rank tensor approximation of the geometry
+    /// coefficients
+    ///
+    /// As above; the boundary conditions of the component \f$ c \f$ are
+    /// those registered for the unknown 0 with the component \f$ c \f$ or
+    /// with all components.
+    static gsSparseMatrix<T> elasticityLowRankMatrix(
+        const gsBasis<T>& basis,
+        const gsGeometry<T>& geo,
+        const gsBoundaryConditions<T>& bc,
+        const gsOptionList& opt,
+        T lambda,
+        T mu,
+        T tol = (T)(1e-10)
+    );
+
+    /// Provides \a gsLinearOperator representing the stiffness matrix of
+    /// linear elasticity on a single patch in a matrix-free way, from the
+    /// same low rank approximation as \a elasticityLowRankMatrix
+    ///
+    /// No global matrix is formed. A term with the tensor train ranks
+    /// \f$ r_1, \dots, r_{d-1} \f$ (and \f$ r_0 = r_d = 1 \f$) is applied
+    /// direction by direction with \f$ \sum_{m=0}^{d-1} r_m r_{m+1} \f$
+    /// banded univariate matrices, each of which costs \f$ 2p+1 \f$
+    /// operations per unknown of a component. The application is cheaper
+    /// than a sparse matrix-vector product only for small ranks. The
+    /// storage is that of the univariate matrices.
+    ///
+    /// \param basis   A tensor basis (of one displacement component)
+    /// \param geo     Geometry map of the patch
+    /// \param bc      Boundary conditions for each component
+    /// \param opt     Assembler options (quadrature rule)
+    /// \param lambda  First Lame parameter
+    /// \param mu      Second Lame parameter (shear modulus)
+    /// \param tol     Relative tolerance of the tensor train SVD
+    static OpUPtr            elasticityLowRankOp(
+        const gsBasis<T>& basis,
+        const gsGeometry<T>& geo,
+        const std::vector< gsBoundaryConditions<T> >& bc,
+        const gsOptionList& opt,
+        T lambda,
+        T mu,
+        T tol = (T)(1e-10)
+    );
+
+    /// Provides \a gsLinearOperator representing the stiffness matrix of
+    /// linear elasticity on a single patch in a matrix-free way
+    ///
+    /// As above; the boundary conditions of the component \f$ c \f$ are
+    /// those registered for the unknown 0 with the component \f$ c \f$ or
+    /// with all components.
+    static OpUPtr            elasticityLowRankOp(
+        const gsBasis<T>& basis,
+        const gsGeometry<T>& geo,
+        const gsBoundaryConditions<T>& bc,
+        const gsOptionList& opt,
+        T lambda,
+        T mu,
+        T tol = (T)(1e-10)
+    );
+
     /// Provides \a gsLinearOperator representing the subspace corrected mass smoother
     /// on the parameter domain (SIAM J. on Numerical Analysis. 55 (4). p. 2004 - 2024, 2017)
     ///

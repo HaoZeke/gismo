@@ -309,6 +309,120 @@ SUITE(gsPreconditioner_test)
         CHECK ( solver.error() <= solver.tolerance() );
     }
 
+    TEST(gsLowRankElasticity_test)
+    {
+        // The low rank matrix and operator against the matrix that
+        // gsExprAssembler assembles element by element with the same
+        // quadrature rule: a quarter annulus in 2D and a cube with moved
+        // interior control points in 3D, whose coefficients are not products
+        // of univariate functions
+        const real_t lambda = 0.5769, mu = 0.3846; // Young's modulus 1, Poisson's ratio 0.3
+        for (index_t dim=2; dim!=4; ++dim)
+        {
+            gsMultiPatch<> mp;
+            if (dim==2)
+                mp.addPatch( *gsNurbsCreator<>::BSplineFatQuarterAnnulus(1,2) );
+            else
+            {
+                mp.addPatch( *gsNurbsCreator<>::BSplineCube(1) );
+                mp.patch(0).degreeElevate(1);
+                mp.patch(0).uniformRefine();
+                gsMatrix<>& coefs = mp.patch(0).coefs();
+                // the control point in the middle of the 4x4x4 net
+                const index_t mid = 1 + 4 * (1 + 4 * 1);
+                coefs(mid,0) += 0.1;
+                coefs(mid,1) -= 0.05;
+                coefs(mid,2) += 0.08;
+            }
+            mp.computeTopology();
+
+            gsMultiBasis<> mb(mp,true);
+            mb.setDegree(2);
+            for (index_t i=0; i!=4-dim; ++i)
+                mb.uniformRefine();
+
+            gsConstantFunction<> zero(gsVector<>::Zero(dim),dim), zero1(0,dim);
+            gsBoundaryConditions<> bc;
+            bc.addCondition( 0, boundary::west, condition_type::dirichlet, &zero, 0, false, -1 );
+            bc.addCondition( 0, boundary::south, condition_type::dirichlet, &zero1, 0, false, 1 );
+            bc.setGeoMap(mp);
+
+            gsExprAssembler<> assembler(1,1);
+            assembler.setIntegrationDomain(mb.domain());
+            gsExprAssembler<>::geometryMap G = assembler.getMap(mp);
+            gsExprAssembler<>::space u = assembler.getSpace(mb,dim);
+            u.setup(bc, dirichlet::l2Projection, 0);
+            assembler.initSystem();
+            auto jac = ijac(u,G);
+            assembler.assemble(
+                lambda * idiv(u,G) * idiv(u,G).tr() * meas(G)
+                + mu * ( (jac.cwisetr() + jac) % jac.tr() ) * meas(G)
+            );
+            const gsSparseMatrix<>& mat = assembler.matrix();
+            const gsOptionList& opt = assembler.options();
+
+            // All singular values kept: the same matrix up to rounding
+            const gsSparseMatrix<> full = gsPatchPreconditionersCreator<>::elasticityLowRankMatrix(
+                mb[0], mp.patch(0), bc, opt, lambda, mu, 1.e-14);
+            CHECK ( full.rows() == mat.rows() && full.cols() == mat.cols() );
+            CHECK ( (full - mat).norm() <= 1.e-12 * mat.norm() );
+
+            // Truncated: the error follows the tolerance
+            const gsSparseMatrix<> trunc = gsPatchPreconditionersCreator<>::elasticityLowRankMatrix(
+                mb[0], mp.patch(0), bc, opt, lambda, mu, 1.e-6);
+            CHECK ( (trunc - mat).norm() <= 1.e-5 * mat.norm() );
+
+            // Matrix-free operator
+            gsLinearOperator<>::Ptr op = gsPatchPreconditionersCreator<>::elasticityLowRankOp(
+                mb[0], mp.patch(0), bc, opt, lambda, mu, 1.e-14);
+            CHECK ( op->rows() == mat.rows() && op->cols() == mat.cols() );
+            gsMatrix<> x, y;
+            x.setRandom(mat.rows(),2);
+            op->apply(x,y);
+            CHECK ( (y - mat * x).norm() <= 1.e-12 * (mat * x).norm() );
+
+            // CG with the operator and the fast diagonalization
+            gsMatrix<> rhs, sol;
+            rhs.setRandom(mat.rows(),1);
+            sol.setZero(mat.rows(),1);
+            gsConjugateGradient<> solver(op,
+                gsPatchPreconditionersCreator<>::elasticityFastDiagonalizationOp(mb[0],bc,opt,lambda,mu,&mp.patch(0)));
+            solver.setTolerance( 1.e-8 );
+            solver.setMaxIterations( 60 );
+            solver.solve(rhs,sol);
+            CHECK ( solver.error() <= solver.tolerance() );
+        }
+
+        // Constant Jacobian: all ranks are one, so a loose tolerance is exact
+        {
+            gsMultiPatch<> mp( *gsNurbsCreator<>::BSplineCube(1) );
+            mp.patch(0).coefs().col(0) *= 3;
+            mp.computeTopology();
+            gsMultiBasis<> mb(mp,true);
+            mb.setDegree(2);
+            mb.uniformRefine();
+            gsConstantFunction<> zero(gsVector<>::Zero(3),3);
+            gsBoundaryConditions<> bc;
+            bc.addCondition( 0, boundary::west, condition_type::dirichlet, &zero, 0, false, -1 );
+            bc.setGeoMap(mp);
+            gsExprAssembler<> assembler(1,1);
+            assembler.setIntegrationDomain(mb.domain());
+            gsExprAssembler<>::geometryMap G = assembler.getMap(mp);
+            gsExprAssembler<>::space u = assembler.getSpace(mb,3);
+            u.setup(bc, dirichlet::l2Projection, 0);
+            assembler.initSystem();
+            auto jac = ijac(u,G);
+            assembler.assemble(
+                lambda * idiv(u,G) * idiv(u,G).tr() * meas(G)
+                + mu * ( (jac.cwisetr() + jac) % jac.tr() ) * meas(G)
+            );
+            const gsSparseMatrix<>& mat = assembler.matrix();
+            const gsSparseMatrix<> lr = gsPatchPreconditionersCreator<>::elasticityLowRankMatrix(
+                mb[0], mp.patch(0), bc, assembler.options(), lambda, mu, 1.e-2);
+            CHECK ( (lr - mat).norm() <= 1.e-12 * mat.norm() );
+        }
+    }
+
     TEST(gsPatchPreconditioner_stiff_test)
     {
         // Define Geometry
