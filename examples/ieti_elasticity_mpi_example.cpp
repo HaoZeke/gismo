@@ -44,7 +44,10 @@
     of the library classes, option --check-direct with a direct solve of the
     assembled global system by gsElasticityAssembler).
 
-    The result is printed as one line of key=value fields.
+    The result is printed as one line of key=value fields. The fields mem_*
+    give the resident set size (MiB, maximum over the ranks) at the end of
+    each setup phase, rss_peak_max and rss_peak_mean the peak resident set
+    size of the whole run (MiB, maximum and mean over the ranks).
 
     This file is part of the G+Smo library.
 
@@ -58,6 +61,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iterator>
 #include <map>
 #include <numeric>
@@ -66,6 +70,12 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>
+#include <unistd.h>
+#define IETI_HAVE_RUSAGE 1
 #endif
 
 #ifdef IETI_WITH_LINKCELL
@@ -98,6 +108,39 @@ double wallTime()
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 #endif
+}
+
+/// Peak resident set size of this process (MiB), -1 if unknown
+double peakRss()
+{
+#ifdef IETI_HAVE_RUSAGE
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return -1;
+#  ifdef __APPLE__
+    return ru.ru_maxrss / 1048576.0;   // bytes
+#  else
+    return ru.ru_maxrss / 1024.0;      // kilobytes
+#  endif
+#else
+    return -1;
+#endif
+}
+
+/// Current resident set size of this process (MiB): /proc/self/statm on
+/// Linux, the peak elsewhere
+double currentRss()
+{
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/self/statm", "r");
+    if (f)
+    {
+        long size = 0, resident = 0;
+        const int n = std::fscanf(f, "%ld %ld", &size, &resident);
+        std::fclose(f);
+        if (n == 2) return resident * (double)sysconf(_SC_PAGESIZE) / 1048576.0;
+    }
+#endif
+    return peakRss();
 }
 
 /// Communicator wrapper. The reductions are timed; the time includes the
@@ -345,7 +388,32 @@ struct Timers
                rhs(0), solve(0), total(0), dual(0) {}
 };
 
-void buildProblem(const Options& o, Problem& P, Timers& t)
+/// Resident set size (MiB) at the end of the phases of Timers: after the
+/// topology, the bases, the dof mappers, the primal constraints, the jump
+/// matrices, the multiplier layout, the local setup of the own patches and
+/// the coarse problem
+struct Memory
+{
+    double topo, basis, dofmap, primals, jumps, dual, local, coarse;
+    Memory() : topo(0), basis(0), dofmap(0), primals(0), jumps(0), dual(0), local(0), coarse(0) {}
+
+    /// Fields mem_<phase>=max over the ranks, rss_peak_max and rss_peak_mean
+    std::string fields(const Par& par) const
+    {
+        const double v[] = { topo, basis, dofmap, primals, jumps, dual, local, coarse };
+        const char* k[] = { "mem_topo", "mem_basis", "mem_dofmap", "mem_primals", "mem_jumps",
+                            "mem_dual", "mem_local", "mem_coarse" };
+        std::ostringstream os;
+        os.precision(6);
+        for (size_t i=0; i<sizeof(v)/sizeof(v[0]); ++i)
+            os << " " << k[i] << "=" << par.maxOf(v[i]);
+        const double peak = peakRss();
+        os << " rss_peak_max=" << par.maxOf(peak) << " rss_peak_mean=" << par.sumOf(peak)/par.size;
+        return os.str();
+    }
+};
+
+void buildProblem(const Options& o, Problem& P, Timers& t, Memory& m)
 {
     double t0 = wallTime();
     P.grid[0] = P.grid[1] = P.grid[2] = 0;
@@ -375,6 +443,7 @@ void buildProblem(const Options& o, Problem& P, Timers& t)
         P.mp.computeTopology();
     }
     t.topo += wallTime() - t0;
+    m.topo = currentRss();
     t0 = wallTime();
     const index_t dim = P.dim;
     P.nPatches = P.mp.nPatches();
@@ -422,6 +491,7 @@ void buildProblem(const Options& o, Problem& P, Timers& t)
         P.bc[r].setGeoMap(P.mp);
 
     t.basis += wallTime() - t0;
+    m.basis = currentRss();
     t0 = wallTime();
 
     // IETI mappers, one per displacement component
@@ -437,6 +507,7 @@ void buildProblem(const Options& o, Problem& P, Timers& t)
     for (index_t r=0; r<dim; ++r)
         P.nUnknowns += P.mapper[r].dofMapperGlobal().freeSize();
     t.dofmap += wallTime() - t0;
+    m.dofmap = currentRss();
 }
 
 /// Primal constraints; averages are assembled for the given patches only
@@ -1721,7 +1792,7 @@ public:
     IetiMpi(const Problem& P, Par& par, const Options& o, std::vector<index_t> mine, const Dual& dual)
     : m_P(P), m_par(par), m_opt(o), m_mine(give(mine)), m_dual(dual), m_stats(new InnerStats), m_schurOp(*this), m_precOp(*this) {}
 
-    void setup(Timers& t);
+    void setup(Timers& t, Memory& m);
 
     /// Distributed Schur complement of the IETI-DP system
     class Schur : public Op
@@ -1816,7 +1887,7 @@ private:
     friend class Prec;
 };
 
-void IetiMpi::setup(Timers& t)
+void IetiMpi::setup(Timers& t, Memory& mem)
 {
     const index_t nPrimal = m_P.nPrimal;
     std::vector<int>    ti, tj;
@@ -1972,6 +2043,8 @@ void IetiMpi::setup(Timers& t)
         t.factor += wallTime() - t0;
     }
 
+    mem.local = currentRss();
+
     // The wait for the slowest rank is measured separately from the coarse work.
     double t0 = wallTime();
     m_par.barrier();
@@ -1986,6 +2059,7 @@ void IetiMpi::setup(Timers& t)
     }
     m_fc = fc;
     t.coarse += wallTime() - t0;
+    mem.coarse = currentRss();
 
     // Right-hand side of the Schur complement system
     t0 = wallTime();
@@ -2344,13 +2418,14 @@ int main(int argc, char* argv[])
 
     const double tStart = wallTime();
     Timers tm;
+    Memory mem;
     int status = 0;
     std::string failures;
 
     // Problem setup (replicated)
     Problem P;
     double t0 = wallTime();
-    buildProblem(o, P, tm);
+    buildProblem(o, P, tm, mem);
     tm.mapper = wallTime() - t0;
     GISMO_ENSURE(o.emulateRanks == 0 || (o.setupOnly && par.size == 1),
                  "--emulate-ranks needs --setup-only and one MPI rank.");
@@ -2390,6 +2465,7 @@ int main(int argc, char* argv[])
     const std::vector<index_t> subset = (o.check || o.checkDirect) ? std::vector<index_t>() : mine;
     buildPrimals(P, o, subset);
     tm.primals += wallTime() - t0;
+    mem.primals = currentRss();
     double t1 = wallTime();
     // Patches of other ranks near the own ones (distributed multipliers)
     std::vector<index_t> halo;
@@ -2408,10 +2484,12 @@ int main(int argc, char* argv[])
         buildJumps(P, jumpSet);
     }
     tm.jumps += wallTime() - t1;
+    mem.jumps = currentRss();
     tm.mapper += wallTime() - t0;
     t1 = wallTime();
     const Dual dual = buildDual(P, o, par, owner, mine, halo, status, failures);
     tm.dual += wallTime() - t1;
+    mem.dual = currentRss();
     if (par.maxOf((index_t)status) != 0 && status == 0)
     { status = 1; failures += " dual-layout-on-another-rank"; }
 
@@ -2419,7 +2497,7 @@ int main(int argc, char* argv[])
     struct SetupReport
     {
         static void print(const Par& par, const Options& o, const Problem& P, const Timers& t,
-                          double tPartition, index_t owned, const char* stage)
+                          const Memory& m, double tPartition, index_t owned, const char* stage)
         {
             const double v[] = { t.mapper, t.topo, t.basis, t.dofmap, t.primals, t.jumps,
                                  t.assembly, t.factor, t.wait, t.coarse, t.cassemble, t.cfactor };
@@ -2439,12 +2517,13 @@ int main(int argc, char* argv[])
                << " t_partition=" << par.maxOf(tPartition);
             for (size_t i=0; i<sizeof(v)/sizeof(v[0]); ++i)
                 os << " " << k[i] << "=" << par.maxOf(v[i]);
+            os << m.fields(par);
             if (par.rank == 0) gsInfo << os.str() << "\n";
         }
     };
     if (o.setupOnly && o.emulateRanks > 0)
     {
-        SetupReport::print(par, o, P, tm, tPartition, mine.size(), "mapper");
+        SetupReport::print(par, o, P, tm, mem, tPartition, mine.size(), "mapper");
         if (dual.distributed)
         {
             // Multiplier-vector arithmetic of this rank in both layouts
@@ -2482,10 +2561,10 @@ int main(int argc, char* argv[])
     }
 
     IetiMpi ieti(P, par, o, mine, dual);
-    ieti.setup(tm);
+    ieti.setup(tm, mem);
     if (o.setupOnly)
     {
-        SetupReport::print(par, o, P, tm, tPartition, mine.size(), "coarse");
+        SetupReport::print(par, o, P, tm, mem, tPartition, mine.size(), "coarse");
         return 0;
     }
 
@@ -2676,6 +2755,7 @@ int main(int argc, char* argv[])
     const real_t condMax  = cond;
     const double dirCalls = par.sumOf(ieti.stats().dirCalls), dirIters = par.sumOf(ieti.stats().dirIters),
                  conCalls = par.sumOf(ieti.stats().conCalls), conIters = par.sumOf(ieti.stats().conIters);
+    const std::string memFields = mem.fields(par);
     int threads = 1;
 #ifdef _OPENMP
     threads = omp_get_max_threads();
@@ -2749,6 +2829,7 @@ int main(int argc, char* argv[])
            << " chk_comp=" << chkComp
            << " chk_direct_l2=" << chkDirL2
            << " chk_direct_comp=" << chkDirComp
+           << memFields
            << " status=" << (status ? "FAIL" : "PASS");
         if (status) os << " failures=" << failures;
         gsInfo << os.str() << "\n";
