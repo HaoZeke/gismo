@@ -1032,41 +1032,36 @@ std::vector<index_t> haloPatchesMapper(const Problem& P, const std::vector<int>&
 }
 
 #ifdef IETI_WITH_LINKCELL
-/// Candidate patches of other ranks near the patches of this rank: the patch
-/// centroids are binned with cells of one patch extent and lc_halo returns
-/// the cells within one patch extent of a cell that holds an own patch.
+/// Candidate patches of other ranks near the patches of this rank: every
+/// patch whose centroid lies within sqrt(3) times the largest patch extent of
+/// the centroid of an own patch (lc_pairs_within_csr on the centroids). Two
+/// patches that share a vertex are never farther apart than that, since each
+/// centroid lies inside its patch's bounding box.
 std::vector<index_t> haloPatchesLinkcell(const Problem& P, const std::vector<int>& owner, int rank, int parts)
 {
     std::vector<index_t> out;
     if (parts < 2) return out;
     const std::vector<double> xyz = patchCentroids(P);
     const double ext = patchExtent(P);
-    const lc_cell box = lcBox(xyz, 2*ext);
-    const double cutoff = 1.5*ext;
+    const double cutoff = std::sqrt(3.0) * ext * (1.0 + 1e-9);
+    const lc_cell box = lcBox(xyz, 2*cutoff);
     const size_t n = P.nPatches;
-    size_t ncell = 0;
-    int nxyz[3];
-    double width[3];
-    GISMO_ENSURE(0 == lc_mesh_cut(xyz.data(), n, &box, cutoff, NULL, ext, parts, 1, 0.0, 0,
-        nxyz, width, NULL, NULL, 0, 0, &ncell), "lc_mesh_cut query failed: " << lc_last_error());
-    std::vector<int> domain(ncell), pointCell(n);
-    GISMO_ENSURE(0 == lc_mesh_cut(xyz.data(), n, &box, cutoff, NULL, ext, parts, 1, 0.0, 0,
-        nxyz, width, domain.data(), pointCell.data(), ncell, n, &ncell),
-        "lc_mesh_cut failed: " << lc_last_error());
-    std::vector<int> assign(ncell, 0);
+    size_t needOff = 0, needCols = 0;
+    int pbc[3] = {0,0,0};
+    GISMO_ENSURE(0 == lc_pairs_within_csr(xyz.data(), n, &box, pbc, cutoff, NULL, cutoff, 0,
+        NULL, 0, NULL, NULL, 0, &needOff, &needCols), "lc_pairs_within_csr query failed: " << lc_last_error());
+    std::vector<int> off(needOff), cols(std::max<size_t>(needCols, 1));
+    GISMO_ENSURE(0 == lc_pairs_within_csr(xyz.data(), n, &box, pbc, cutoff, NULL, cutoff, 0,
+        off.data(), needOff, cols.data(), NULL, needCols, &needOff, &needCols),
+        "lc_pairs_within_csr failed: " << lc_last_error());
+    std::set<index_t> h;
     for (size_t k=0; k<n; ++k)
-        if (owner[k] == rank) assign[pointCell[k]] = 1;
-    uint32_t reach[3];
-    GISMO_ENSURE(0 == lc_halo_width(ext, 1, width, reach), "lc_halo_width failed: " << lc_last_error());
-    size_t nGhost = 0;
-    GISMO_ENSURE(0 == lc_halo(nxyz, assign.data(), ncell, 1, reach, NULL, 0, &nGhost),
-        "lc_halo query failed: " << lc_last_error());
-    std::vector<int> ghost(std::max<size_t>(nGhost, 1));
-    GISMO_ENSURE(0 == lc_halo(nxyz, assign.data(), ncell, 1, reach, ghost.data(), nGhost, &nGhost),
-        "lc_halo failed: " << lc_last_error());
-    for (size_t g=0; g<nGhost; ++g) assign[ghost[g]] = 1;
-    for (size_t k=0; k<n; ++k)
-        if (owner[k] != rank && assign[pointCell[k]]) out.push_back((index_t)k);
+    {
+        if (owner[k] != rank) continue;
+        for (int c=off[k]; c<off[k+1]; ++c)
+            if (owner[cols[c]] != rank) h.insert((index_t)cols[c]);
+    }
+    out.assign(h.begin(), h.end());
     return out;
 }
 
