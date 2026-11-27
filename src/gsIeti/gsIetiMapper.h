@@ -156,7 +156,7 @@ public:
 public:
 
     /// @brief Returns the number of Lagrange multipliers.
-    index_t nLagrangeMultipliers()
+    index_t nLagrangeMultipliers() const
     {
         GISMO_ASSERT(! m_jumpMatrices.empty(),
             "gsIetiMapper: Number of Lagrange multipliers not yet known.");
