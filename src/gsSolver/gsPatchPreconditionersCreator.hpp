@@ -697,7 +697,9 @@ struct lowRankElasticity
                         inside = (j >= 0 && j < sz[m]);
                         I = I * sz[m] + j;
                     }
-                    if (inside && dofs[e][I] >= 0)
+                    // Entries of basis functions without a common element
+                    // stay exactly zero and are not stored
+                    if (inside && dofs[e][I] >= 0 && bd[J*W+D] != (T)(0))
                         col.push_back(std::make_pair(dofs[e][I], bd[J*W+D]));
                 }
             }
