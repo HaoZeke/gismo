@@ -211,7 +211,7 @@ struct Options
     bool    setupOnly;         // stop after the coarse problem, print the timing split
     index_t emulateRanks;      // setup-only: build the mapper for the patches of rank 0 out of this many
     std::string coarse;        // gather (triplets to all ranks) or reduce (one reduction of the values)
-    std::string coarseSolver;  // lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)
+    std::string coarseSolver;  // lu (SparseLU, COLAMD), lu-amd (SparseLU, AMD) or ldlt (SimplicialLDLT, AMD)
     bool    coarseRoot;        // factorize the coarse matrix on rank 0 only and broadcast its solutions
     real_t  gateMult, gateL2, gateComp, gateDirectL2, gateDirectComp;
 };
@@ -1098,7 +1098,10 @@ OpPtr makeCoarseSolver(const SparseMatrix& A, const std::string& kind)
     if (kind == "ldlt")
         return memory::make_shared(new SparseDirectOp< gsEigen::SimplicialLDLT<
             gsEigen::SparseMatrix<real_t>, gsEigen::Lower, gsEigen::AMDOrdering<int> > >(A));
-    GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu or ldlt).");
+    if (kind == "lu-amd")
+        return memory::make_shared(new SparseDirectOp< gsEigen::SparseLU<
+            gsEigen::SparseMatrix<real_t>, gsEigen::AMDOrdering<int> > >(A));
+    GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu, lu-amd or ldlt).");
     return makeSparseLUSolver(A);
 }
 
@@ -1704,7 +1707,7 @@ int main(int argc, char* argv[])
     cmd.addSwitch("",  "setup-only", "Stop after the coarse problem and print the timing split of the setup", o.setupOnly);
     cmd.addInt   ("",  "emulate-ranks", "With --setup-only on one rank: build the mapper for the patches that rank 0 of this many ranks owns and stop after the mapper phase", o.emulateRanks);
     cmd.addString("",  "coarse",    "Assembly of the coarse matrix: gather (triplets on all ranks) or reduce (pattern from the primal indices, one reduction of the values)", o.coarse);
-    cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)", o.coarseSolver);
+    cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD ordering), lu-amd (SparseLU, AMD ordering) or ldlt (SimplicialLDLT, AMD ordering)", o.coarseSolver);
     cmd.addSwitch("",  "coarse-root", "Factorize the coarse matrix on rank 0 only and broadcast the coarse solutions", o.coarseRoot);
     try { cmd.getValues(argc, argv); } catch (int rv) { return rv; }
     if (o.traction.empty()) o.traction = (o.dim==3) ? "0,0,-1" : "0,-1";
