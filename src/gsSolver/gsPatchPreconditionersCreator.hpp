@@ -494,18 +494,18 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
         gsEigen::Map<Matrix> unfolding(x.data(), rows, cols);
         // For a wide unfolding X, the SVD of X^T = Q R is computed from the
         // SVD of the small factor R^T = U S W^T, so X = U S (Q W)^T
+        const bool wide = rows < cols;
+        gsEigen::HouseholderQR<Matrix> qr;
         Matrix U, V;
         gsEigen::Matrix<T,Dynamic,1> s;
-        if (rows < cols)
+        if (wide)
         {
-            gsEigen::HouseholderQR<Matrix> qr(unfolding.transpose());
+            qr.compute(unfolding.transpose());
             const Matrix Rt = qr.matrixQR().topRows(rows).template triangularView<gsEigen::Upper>().transpose();
             gsEigen::JacobiSVD<Matrix> svd(Rt, gsEigen::ComputeFullU | gsEigen::ComputeFullV);
             U = svd.matrixU();
             s = svd.singularValues();
-            V = Matrix::Zero(cols, rows);
-            V.topRows(rows) = svd.matrixV();
-            V.applyOnTheLeft(qr.householderQ());
+            V = svd.matrixV();
         }
         else
         {
@@ -523,6 +523,14 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
         }
         if (r == 0)
             return false;
+        if (wide)
+        {
+            // Only the kept columns of Q W are formed
+            Matrix QW = Matrix::Zero(cols, r);
+            QW.topRows(rows) = V.leftCols(r);
+            QW.applyOnTheLeft(qr.householderQ());
+            V.swap(QW);
+        }
         cores[m].assign(U.data(), U.data() + rows*r);
         const Matrix rest = s.head(r).asDiagonal() * V.leftCols(r).transpose();
         x.assign(rest.data(), rest.data() + rest.size());
