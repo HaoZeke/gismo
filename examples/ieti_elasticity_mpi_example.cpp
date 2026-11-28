@@ -2235,7 +2235,7 @@ public:
     explicit SparseDirectOp(const SparseMatrix& A) : m_n(A.rows())
     {
         m_solver.compute(A);
-        GISMO_ENSURE(m_solver.info() == gsEigen::Success, "Factorization of the coarse matrix failed.");
+        GISMO_ENSURE(m_solver.info() == gsEigen::Success, "Sparse factorization failed.");
     }
     void apply(const Matrix& x, Matrix& y) const { y = m_solver.solve(x); }
     index_t rows() const { return m_n; }
@@ -2245,13 +2245,29 @@ private:
     index_t m_n;
 };
 
+/// The sparse LU factorization of gsSparseSolver (SparseLU, COLAMD) that
+/// releases its copy of the input matrix after the factorization: the
+/// solves use the factors and the permutations only. The copy is as large as
+/// the matrix.
+class LeanSparseLU : public gsSparseSolver<real_t>::LU
+{
+public:
+    template<class M> void compute(const M& A)
+    {
+        gsSparseSolver<real_t>::LU::compute(A);
+        const index_t n = this->m_mat.rows();
+        this->m_mat.resize(n, n);
+        this->m_mat.data().squeeze();
+    }
+};
+
 OpPtr makeCoarseSolver(const SparseMatrix& A, const std::string& kind)
 {
     if (kind == "ldlt")
         return memory::make_shared(new SparseDirectOp< gsEigen::SimplicialLDLT<
             gsEigen::SparseMatrix<real_t>, gsEigen::Lower, gsEigen::AMDOrdering<int> > >(A));
     GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu or ldlt).");
-    return makeSparseLUSolver(A);
+    return memory::make_shared(new SparseDirectOp<LeanSparseLU>(A));
 }
 
 /// Compressed rows of the coarse matrix: the union of the dense blocks
@@ -2536,7 +2552,7 @@ void IetiMpi::setup(Timers& t, Memory& mem)
             if (m_opt.localSolver == "ldlt")
                 p.solver = makeSparseCholeskySolver(modA);
             else
-                p.solver = makeSparseLUSolver(modA);
+                p.solver = memory::make_shared(new SparseDirectOp<LeanSparseLU>(modA));
             SparseMatrix Psi = gsPrimalSystem<>::primalBasis(
                 p.solver, embBasis, rhsBasis, raw.primalIdx, nPrimal);
             for (index_t j=0; j<m; ++j)
