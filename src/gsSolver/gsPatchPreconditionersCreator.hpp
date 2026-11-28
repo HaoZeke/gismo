@@ -22,6 +22,9 @@
 #include <gsNurbs/gsTensorBSplineBasis.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 
 namespace gismo
 {
@@ -478,11 +481,27 @@ lowRankBanded<T> assembleLowRankFactor(const univariateQuadrature<T>& qu,
 // the sizes sz and the absolute tolerance tol. The core m is stored in
 // cores[m] with the entry (a,q,b) at a + ranks[m]*(q + sz[m]*b), where
 // ranks[0] = ranks[d] = 1. Returns false if the tensor is truncated to zero.
+//
+// Every unfolding X is reduced by a Householder QR to its small square
+// factor, whose SVD is computed by the one-sided Jacobi method: a wide X
+// from X^T = Q R and R^T = U S W^T, so X = U S (Q W)^T; a tall X from
+// X = Q R and R = W S V^T, so X = (Q W) S V^T. The Jacobi SVD is accurate
+// to working precision in every singular value and vector of the factor.
+// The environment variable GISMO_LOWRANK_SVD=bdc takes Eigen's
+// divide-and-conquer SVD for tall unfoldings instead (the earlier method,
+// for comparison), and GISMO_LOWRANK_VERBOSE prints, per unfolding, the
+// sizes, the method, the kept rank, the first and last kept and first
+// dropped singular values, and the relative Frobenius residual of the
+// untruncated decomposition.
 template<typename T>
 bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
-                    std::vector< std::vector<T> >& cores, std::vector<index_t>& ranks)
+                    std::vector< std::vector<T> >& cores, std::vector<index_t>& ranks,
+                    index_t term = -1)
 {
     typedef gsEigen::Matrix<T,Dynamic,Dynamic> Matrix;
+    const char* method = std::getenv("GISMO_LOWRANK_SVD");
+    const bool bdc     = method && std::string(method) == "bdc";
+    const bool verbose = std::getenv("GISMO_LOWRANK_VERBOSE") != NULL;
     const index_t d = (index_t)sz.size();
     cores.resize(d);
     ranks.assign(d+1,1);
@@ -492,13 +511,19 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
     {
         const index_t rows = ranks[m] * sz[m], cols = total / sz[m];
         gsEigen::Map<Matrix> unfolding(x.data(), rows, cols);
-        // For a wide unfolding X, the SVD of X^T = Q R is computed from the
-        // SVD of the small factor R^T = U S W^T, so X = U S (Q W)^T
         const bool wide = rows < cols;
+        const bool useBdc = bdc && !wide;
         gsEigen::HouseholderQR<Matrix> qr;
         Matrix U, V;
         gsEigen::Matrix<T,Dynamic,1> s;
-        if (wide)
+        if (useBdc)
+        {
+            gsEigen::BDCSVD<Matrix> svd(unfolding, gsEigen::ComputeThinU | gsEigen::ComputeThinV);
+            U = svd.matrixU();
+            s = svd.singularValues();
+            V = svd.matrixV();
+        }
+        else if (wide)
         {
             qr.compute(unfolding.transpose());
             const Matrix Rt = qr.matrixQR().topRows(rows).template triangularView<gsEigen::Upper>().transpose();
@@ -509,7 +534,9 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
         }
         else
         {
-            gsEigen::BDCSVD<Matrix> svd(unfolding, gsEigen::ComputeThinU | gsEigen::ComputeThinV);
+            qr.compute(unfolding);
+            const Matrix R = qr.matrixQR().topRows(cols).template triangularView<gsEigen::Upper>();
+            gsEigen::JacobiSVD<Matrix> svd(R, gsEigen::ComputeFullU | gsEigen::ComputeFullV);
             U = svd.matrixU();
             s = svd.singularValues();
             V = svd.matrixV();
@@ -521,15 +548,53 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
             tail += s[r-1]*s[r-1];
             --r;
         }
+        if (verbose)
+        {
+            // residual of the untruncated decomposition, before any column is dropped
+            Matrix full;
+            if (useBdc)
+                full = U * s.asDiagonal() * V.transpose();
+            else if (wide)
+            {
+                Matrix QW = Matrix::Zero(cols, rows);
+                QW.topRows(rows) = V;
+                QW.applyOnTheLeft(qr.householderQ());
+                full = U * s.asDiagonal() * QW.transpose();
+            }
+            else
+            {
+                Matrix QU = Matrix::Zero(rows, cols);
+                QU.topRows(cols) = U;
+                QU.applyOnTheLeft(qr.householderQ());
+                full = QU * s.asDiagonal() * V.transpose();
+            }
+            std::cerr << "low-rank tt term=" << term << " unfolding=" << m
+                      << " rows=" << rows << " cols=" << cols
+                      << " method=" << (useBdc ? "bdc" : "qr-jacobi")
+                      << " rank=" << r << " of " << s.rows()
+                      << " s_first=" << (s.rows() ? s[0] : (T)0)
+                      << " s_last_kept=" << (r > 0 ? s[r-1] : (T)0)
+                      << " s_first_dropped=" << (r < s.rows() ? s[r] : (T)0)
+                      << " residual=" << (full - unfolding).norm() / unfolding.norm()
+                      << std::endl;
+        }
         if (r == 0)
             return false;
-        if (wide)
+        if (wide && !useBdc)
         {
             // Only the kept columns of Q W are formed
             Matrix QW = Matrix::Zero(cols, r);
             QW.topRows(rows) = V.leftCols(r);
             QW.applyOnTheLeft(qr.householderQ());
             V.swap(QW);
+        }
+        else if (!wide && !useBdc)
+        {
+            // Only the kept columns of Q W are formed
+            Matrix QU = Matrix::Zero(rows, r);
+            QU.topRows(cols) = U.leftCols(r);
+            QU.applyOnTheLeft(qr.householderQ());
+            U.swap(QU);
         }
         cores[m].assign(U.data(), U.data() + rows*r);
         const Matrix rest = s.head(r).asDiagonal() * V.leftCols(r).transpose();
@@ -918,7 +983,7 @@ void setupLowRankElasticity(const gsBasis<T>& basis,
     {
         if (norms[f] <= abstol)
             continue;
-        const bool nonzero = tensorTrainSvd(values[f], nq, abstol, cores, ranks);
+        const bool nonzero = tensorTrainSvd(values[f], nq, abstol, cores, ranks, (index_t)f);
         std::vector<T>().swap(values[f]);
         if (!nonzero)
             continue;
