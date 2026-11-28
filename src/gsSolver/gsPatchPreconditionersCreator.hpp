@@ -209,6 +209,87 @@ gsVector<T> averageMetricDiagonal(const gsGeometry<T>& geo)
     return result;
 }
 
+// Contracts mode m of the tensor in (sizes sz, first index fastest) with the
+// matrix A (A.rows() x sz[m]); the result has sz[m] replaced by A.rows().
+template<typename T>
+std::vector<T> contractMode(const std::vector<T>& in, const std::vector<index_t>& sz,
+                            index_t m, const gsMatrix<T>& A)
+{
+    index_t inner = 1, outer = 1;
+    for ( index_t i=0; i<m; ++i ) inner *= sz[i];
+    for ( index_t i=m+1; i<(index_t)sz.size(); ++i ) outer *= sz[i];
+    const index_t nin = sz[m], nout = A.rows();
+    std::vector<T> out(inner*nout*outer, T(0));
+    for ( index_t o=0; o<outer; ++o )
+        for ( index_t c=0; c<nin; ++c )
+        {
+            const T* src = &in[(o*nin + c)*inner];
+            for ( index_t r=0; r<nout; ++r )
+            {
+                const T a = A(r,c);
+                if ( a == T(0) )
+                    continue;
+                T* dst = &out[(o*nout + r)*inner];
+                for ( index_t i=0; i<inner; ++i )
+                    dst[i] += a * src[i];
+            }
+        }
+    return out;
+}
+
+// Jacobians of a non-rational tensor B-spline geometry on the tensor grid of
+// the univariate nodes (point index, first direction fastest), by sum
+// factorization: J(a,k) = sum_i C(i,a) prod_m B_m^(k==m)(x_m), applied one
+// direction at a time to the coefficients instead of evaluating the whole
+// basis at every point. J(a,k) of point p is J[p*D*D + a + D*k]. Returns false
+// when the geometry is not of that kind.
+template<short_t D, typename T>
+bool tensorGridJacobians(const gsGeometry<T>& geo, const std::vector< univariateQuadrature<T> >& qu,
+                         std::vector<T>& J)
+{
+    const gsTensorBSplineBasis<D,T>* tb = dynamic_cast<const gsTensorBSplineBasis<D,T>*>(&geo.basis());
+    if ( !tb )
+        return false;
+    std::vector<index_t> sz(D);
+    std::vector< gsMatrix<T> > V(D), Dv(D);
+    index_t ntot = 1;
+    for ( short_t m=0; m<D; ++m )
+    {
+        const gsBSplineBasis<T>& b = tb->component(m);
+        const gsMatrix<T>& x = qu[m].nodes;
+        gsMatrix<index_t> act;
+        std::vector< gsMatrix<T> > ders;
+        b.active_into(x, act);
+        b.evalAllDers_into(x, 1, ders);
+        sz[m] = b.size();
+        V[m].setZero(x.cols(), sz[m]);
+        Dv[m].setZero(x.cols(), sz[m]);
+        for ( index_t j=0; j<x.cols(); ++j )
+            for ( index_t r=0; r<act.rows(); ++r )
+            {
+                V[m](j, act(r,j))  = ders[0](r,j);
+                Dv[m](j, act(r,j)) = ders[1](r,j);
+            }
+        ntot *= x.cols();
+    }
+    const gsMatrix<T>& C = geo.coefs();
+    J.assign(ntot*D*D, T(0));
+    for ( short_t a=0; a<D; ++a )
+        for ( short_t k=0; k<D; ++k )
+        {
+            std::vector<T> cur(C.col(a).data(), C.col(a).data() + C.rows());
+            std::vector<index_t> cs = sz;
+            for ( short_t m=0; m<D; ++m )
+            {
+                cur = contractMode(cur, cs, m, m == k ? Dv[m] : V[m]);
+                cs[m] = qu[m].nodes.cols();
+            }
+            for ( index_t p=0; p<ntot; ++p )
+                J[p*D*D + a + D*k] = cur[p];
+        }
+    return true;
+}
+
 // Sums of |det J| (J^{-1})_{kc}^2 over the tensor grid of the quadrature
 // nodes, where J is the Jacobian of the geometry. For the direction k, the
 // component c and the direction j, result[(k*d+c)*d+j] has one entry per
@@ -891,8 +972,34 @@ void setupLowRankElasticity(const gsBasis<T>& basis,
     }
     result.N = offset;
 
-    // |det J| and J^{-1} on the tensor grid of the quadrature nodes
+    // |det J| and J^{-1} on the tensor grid of the quadrature nodes; a tensor
+    // B-spline geometry by sum factorization, any other through jacobian_into
     std::vector<T> detJ(ntot), Jinv(ntot*d*d);
+    std::vector<T> gridJ;
+    const bool sumFactorized = (d == 2 && tensorGridJacobians<2,T>(geo, qu, gridJ))
+                            || (d == 3 && tensorGridJacobians<3,T>(geo, qu, gridJ));
+    if ( sumFactorized )
+    {
+        gsMatrix<T> J(d,d), Ji;
+        T sign = 0;
+        for ( index_t p=0; p<ntot; ++p )
+        {
+            for ( index_t a=0; a<d; ++a )
+                for ( index_t k=0; k<d; ++k )
+                    J(a,k) = gridJ[p*d*d + a + d*k];
+            const T det = J.determinant();
+            if (sign == 0)
+                sign = det > 0 ? 1 : -1;
+            GISMO_ENSURE ( sign * det > 0,
+                "gsPatchPreconditionersCreator: the geometry map is not regular at a quadrature node." );
+            detJ[p] = sign * det;
+            Ji = J.inverse();
+            for ( index_t a=0; a<d; ++a )
+                for ( index_t b=0; b<d; ++b )
+                    Jinv[p*d*d + a + d*b] = Ji(a,b);
+        }
+    }
+    else
     {
         const index_t chunk = 16384;
         gsMatrix<T> pts, jacs, J, Ji;
