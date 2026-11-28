@@ -16,17 +16,27 @@
     the scaled Dirichlet preconditioner and gsConjugateGradient solves the
     Schur complement system in the Lagrange multipliers.
 
-    Parallelization. The patches are distributed over the MPI ranks. Each rank
-    assembles and factorizes only its own patches. The vector of Lagrange
-    multipliers is replicated on all ranks. Every application of the Schur
-    complement or of the preconditioner evaluates the contributions of the
-    local patches and sums them over the ranks with MPI_Allreduce. The coarse
-    matrix is assembled with one reduction of its values over a sparsity
-    pattern that every rank builds from the primal indices of all patches,
-    and it is factorized on rank 0, which broadcasts the coarse solutions
-    (--coarse-on=all factorizes it on every rank). Because the conjugate gradient
-    iteration only acts on replicated vectors, gsConjugateGradient is used
-    unchanged.
+    Parallelization. The patches are distributed over the MPI ranks. Every
+    rank holds the patches of the whole domain with their topology (one
+    trilinear patch per subdomain for the generated box) and, as compact
+    integer data, the neighbours of every patch. Bases, dof mappers and the
+    gsIetiMapper are built only for the own patches and two layers of
+    neighbours around them, which contain all patches that share a dof with an
+    own patch or with one of its neighbours. The global numbering of the
+    multipliers and of the primal dofs is that of gsIetiMapper on all
+    patches: every rank counts the multipliers and primal dofs whose first
+    occurrence lies on its own patches, and one sum of these counts over the
+    ranks gives the first global index on each patch. Each rank assembles and
+    factorizes only its own patches; its jump matrices have one row per
+    multiplier of its patches. The vector of Lagrange multipliers is
+    replicated on all ranks. Every application of the Schur complement or of
+    the preconditioner evaluates the contributions of the local patches and
+    sums them over the ranks with MPI_Allreduce. The coarse matrix is
+    assembled on rank 0 from the dense blocks of all ranks, received one rank
+    after the other, and factorized there; rank 0 broadcasts the coarse
+    solutions (--coarse-on=all assembles and factorizes it on every rank).
+    Because the conjugate gradient iteration only acts on replicated vectors,
+    gsConjugateGradient is used unchanged.
 
     With --multipliers=distributed a rank holds only the multipliers that
     touch its patches. A multiplier couples two patches, so it lives on one
@@ -36,8 +46,14 @@
     iteration reduces one scalar per inner product. The adjacent ranks and
     the shared multipliers come from a search over the own patches and the
     patches near them (linkcell: halo cells of the patch grid and a pair
-    search over the Greville points of the coupled dofs), followed by one
-    exchange of candidate lists between adjacent ranks.
+    search over the Greville points of the coupled dofs; mapper: the inverse
+    of the dof mapper of the local patches), followed by one exchange of
+    candidate lists between adjacent ranks.
+
+    The checks (--check, --check-direct, --check-topology) build the problem
+    on all patches on every rank in addition and compare with it; this
+    includes the global numbering, which must equal that of gsIetiMapper on
+    all patches.
 
     The program checks its own result and exits with a non-zero code if a
     check fails (option --check compares with the serial IETI-DP implementation
@@ -63,6 +79,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <set>
@@ -222,6 +239,26 @@ struct Par
         MPI_Allgatherv(in.data(), n, dt, out.data(), cnt.data(), dsp.data(), dt, comm);
         return out;
     }
+    /// Concatenation of the vectors of all ranks, in rank order, on rank 0
+    /// (empty elsewhere)
+    template<class T> std::vector<T> gatherRoot(const std::vector<T>& in, MPI_Datatype dt) const
+    {
+        if (size==1) return in;
+        std::vector<int> cnt(rank==0 ? size : 1), dsp(rank==0 ? size : 1);
+        int n = (int)in.size();
+        MPI_Gather(&n, 1, MPI_INT, cnt.data(), 1, MPI_INT, 0, comm);
+        int tot = 0;
+        if (rank==0) for (int i=0; i<size; ++i) { dsp[i] = tot; tot += cnt[i]; }
+        std::vector<T> out(tot);
+        MPI_Gatherv(in.data(), n, dt, out.data(), cnt.data(), dsp.data(), dt, 0, comm);
+        return out;
+    }
+    /// Sum over the ranks, on every rank
+    void sumAll(std::vector<long long>& v) const
+    {
+        if (size>1 && !v.empty())
+            MPI_Allreduce(MPI_IN_PLACE, v.data(), (int)v.size(), MPI_LONG_LONG, MPI_SUM, comm);
+    }
     static MPI_Datatype dtype(const int*)    { return MPI_INT;    }
     static MPI_Datatype dtype(const double*) { return MPI_DOUBLE; }
     /// Ranks adjacent to this one: the given list and every rank that lists
@@ -261,15 +298,19 @@ struct Par
     index_t minOf(index_t v) const { return v; }
     index_t maxOf(index_t v) const { return v; }
     template<class T> std::vector<T> allgatherv(const std::vector<T>& in, int) const { return in; }
+    template<class T> std::vector<T> gatherRoot(const std::vector<T>& in, int) const { return in; }
+    void sumAll(std::vector<long long>&) const {}
     static int dtype(const int*)    { return 0; }
     static int dtype(const double*) { return 0; }
 #endif
     template<class T> std::vector<T> gather(const std::vector<T>& in) const
     { return allgatherv(in, dtype((const T*)NULL)); }
+    template<class T> std::vector<T> gatherToRoot(const std::vector<T>& in) const
+    { return gatherRoot(in, dtype((const T*)NULL)); }
 };
 
 //---------------------------------------------------------------------------
-// Problem definition (replicated on all ranks)
+// Problem definition
 //---------------------------------------------------------------------------
 
 struct Options
@@ -293,29 +334,82 @@ struct Options
     index_t lcMethod;          // linkcell partition method
     std::string tag;
     bool    setupOnly;         // stop after the coarse problem, print the timing split
-    index_t emulateRanks;      // setup-only: build the mapper for the patches of rank 0 out of this many
-    std::string coarse;        // gather (triplets to all ranks) or reduce (one reduction of the values)
+    index_t emulateRanks;      // setup-only: build the local patches of rank 0 out of this many
+    std::string coarse;        // gather (triplets to all ranks) or reduce (pattern from the primal indices)
     std::string coarseSolver;  // lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)
     bool    coarseRoot;        // factorize the coarse matrix on rank 0 only and broadcast its solutions
     std::string coarseOn;      // root or all: where the coarse matrix is factorized
     std::string multipliers;   // replicated (one reduction per application) or distributed (neighbour exchange)
-    std::string dualNeighbours; // linkcell (halo and pair search) or mapper (inverse of the global dof mapper)
+    std::string dualNeighbours; // linkcell (halo and pair search) or mapper (inverse of the local dof mapper)
     real_t  gateMult, gateL2, gateComp, gateDirectL2, gateDirectComp;
 };
 
+/// The domain and the discretization that one rank needs.
+///
+/// Global part (every rank): the patches with their geometry as given and
+/// their topology, the boundary sides that are clamped or loaded, the
+/// patches that share a vertex with each patch, and the shared components
+/// (edges, faces) in the order of gsBoxTopology::allComponents. This is
+/// compact: a generated box has one trilinear patch per subdomain.
+///
+/// Local part: bases, boundary conditions and gsIetiMapper for the local
+/// patches only, the own patches and their neighbours up to a small depth.
+/// A local patch is complete if all its neighbours are local; the coupled
+/// dofs of a complete patch then have the same groups as in the dof mapper
+/// of all patches. The global numbering of the multipliers and the primal
+/// dofs is that of gsIetiMapper on all patches: per patch counts, summed
+/// over the ranks, give the first global index of the entities whose first
+/// occurrence (lowest patch, then lowest basis index) lies on that patch.
 struct Problem
 {
     index_t dim;
-    gsMultiPatch<>                   mp;
-    gsMultiBasis<>                   mb;
-    std::vector<gsBoundaryConditions<> > bc;
-    std::vector<gsIetiMapper<> >     mapper;
-    index_t nPatches, nLambda, nPrimal, nUnknowns;
-    index_t grid[3];                    // patches per direction, 0 if unknown
+    index_t nPatches;                         ///< patches of the whole domain
+    index_t grid[3];                          ///< patches per direction, 0 if unknown
+    gsMultiPatch<>                   global;  ///< all patches and their topology
+    std::vector<int>                 nbrStart, nbr; ///< neighbours of patch k: nbr[nbrStart[k]..nbrStart[k+1])
+    /// [d]: ((first patch, component index), position) of each component of
+    /// dimension d (1 or 2) shared by several patches, sorted by the key;
+    /// the position counts in the order of allComponents of all patches
+    std::vector<std::pair<std::pair<int,int>,int> > compPos[3];
+    index_t nComp[3];
     real_t  lambda, mu;
     std::vector<real_t> traction;
-    std::vector<patchSide> clampSides, tractionSides;
+    std::vector<patchSide> clampSides, tractionSides;   ///< global patch indices
     gsConstantFunction<> zero;
+
+    std::vector<index_t>             gid;      ///< global index of each local patch, ascending
+    std::vector<char>                complete; ///< all neighbours of the local patch are local
+    gsMultiPatch<>                   mp;       ///< local patches and the interfaces between them
+    gsMultiBasis<>                   mb;
+    std::vector<gsBoundaryConditions<> > bc;
+    std::vector<gsIetiMapper<> >     mapper;   ///< one per displacement component, on the local patches
+
+    /// [r]: global index of each local multiplier (primal dof) of component
+    /// r, -1 for those not numbered (first occurrence on an incomplete patch)
+    std::vector<std::vector<index_t> > lambdaGlobal, primalGlobal;
+    index_t nLambda, nPrimal, nUnknowns;      ///< global sizes
+
+    Problem() : dim(0), nPatches(0), nLambda(0), nPrimal(0), nUnknowns(0)
+    { grid[0] = grid[1] = grid[2] = 0; nComp[0] = nComp[1] = nComp[2] = 0; }
+
+    bool isLocal(index_t k) const { return std::binary_search(gid.begin(), gid.end(), k); }
+    /// Local index of the global patch k
+    index_t loc(index_t k) const
+    {
+        const std::vector<index_t>::const_iterator it = std::lower_bound(gid.begin(), gid.end(), k);
+        GISMO_ENSURE(it != gid.end() && *it == k, "Patch " << k << " is not local.");
+        return (index_t)(it - gid.begin());
+    }
+    /// Position of the shared component of dimension d with first patch k (global) and index c
+    index_t compPosition(index_t d, index_t k, index_t c) const
+    {
+        const std::pair<std::pair<int,int>,int> key(std::make_pair((int)k, (int)c), -1);
+        const std::vector<std::pair<std::pair<int,int>,int> >& v = compPos[d];
+        const std::vector<std::pair<std::pair<int,int>,int> >::const_iterator it =
+            std::lower_bound(v.begin(), v.end(), key);
+        GISMO_ENSURE(it != v.end() && it->first == key.first, "Unknown component " << c << " of patch " << k);
+        return it->second;
+    }
 };
 
 std::vector<index_t> parseInts(const std::string& s)
@@ -413,16 +507,19 @@ struct Memory
     }
 };
 
-void buildProblem(const Options& o, Problem& P, Timers& t, Memory& m)
+/// The global part of the problem: patches, topology, material, the clamped
+/// and loaded sides, the neighbours of every patch and the shared components
+void buildGlobal(const Options& o, Problem& P, Timers& t, Memory& m)
 {
     double t0 = wallTime();
+    gsMultiPatch<>& G = P.global;
     P.grid[0] = P.grid[1] = P.grid[2] = 0;
     if (!o.xml.empty())
     {
         gsMultiPatch<>::uPtr in = gsReadFile<>(o.xml);
         GISMO_ENSURE(in, "Cannot read multipatch from " << o.xml);
-        P.mp = *in;
-        P.dim = P.mp.geoDim();
+        G = *in;
+        P.dim = G.geoDim();
     }
     else
     {
@@ -436,17 +533,14 @@ void buildProblem(const Options& o, Problem& P, Timers& t, Memory& m)
                 for (index_t i=0; i<n[0]; ++i)
                 {
                     if (P.dim==3)
-                        P.mp.addPatch( *gsNurbsCreator<>::BSplineCube(1.0, i, j, k) );
+                        G.addPatch( *gsNurbsCreator<>::BSplineCube(1.0, i, j, k) );
                     else
-                        P.mp.addPatch( *gsNurbsCreator<>::BSplineSquare(1.0, i, j) );
+                        G.addPatch( *gsNurbsCreator<>::BSplineSquare(1.0, i, j) );
                 }
-        P.mp.computeTopology();
+        G.computeTopology();
     }
-    t.topo += wallTime() - t0;
-    m.topo = currentRss();
-    t0 = wallTime();
     const index_t dim = P.dim;
-    P.nPatches = P.mp.nPatches();
+    P.nPatches = G.nPatches();
 
     P.lambda = o.young*o.poisson / ((1+o.poisson)*(1-2*o.poisson));
     P.mu     = o.young / (2*(1+o.poisson));
@@ -454,48 +548,133 @@ void buildProblem(const Options& o, Problem& P, Timers& t, Memory& m)
     P.traction.resize(dim, 0.0);
     P.zero = gsConstantFunction<>(0.0, dim);
 
-    // Bases: degree o.degree, o.refine uniform refinements
-    P.mb = gsMultiBasis<>(P.mp, true);
-    for (index_t k=0; k<P.nPatches; ++k)
-        P.mb[k].setDegreePreservingMultiplicity(o.degree);
-    for (index_t i=0; i<o.refine; ++i)
-        P.mb.uniformRefine();
-
-    // Boundary conditions
+    // Clamped and loaded sides
     real_t xmin = 1e300, xmax = -1e300;
     for (index_t k=0; k<P.nPatches; ++k)
     {
-        xmin = std::min(xmin, P.mp[k].coefs().col(0).minCoeff());
-        xmax = std::max(xmax, P.mp[k].coefs().col(0).maxCoeff());
+        xmin = std::min(xmin, G[k].coefs().col(0).minCoeff());
+        xmax = std::max(xmax, G[k].coefs().col(0).maxCoeff());
     }
     const real_t eps = 1e-8*(xmax-xmin);
-    P.bc.assign(dim, gsBoundaryConditions<>());
-    for (gsMultiPatch<>::const_biterator it = P.mp.bBegin(); it < P.mp.bEnd(); ++it)
+    for (gsMultiPatch<>::const_biterator it = G.bBegin(); it < G.bEnd(); ++it)
     {
-        const real_t x = sideMidpoint(P.mp, *it)(0,0);
-        if (x < xmin + eps)
-        {
-            P.clampSides.push_back(*it);
-            for (index_t r=0; r<dim; ++r)
-                P.bc[r].addCondition(*it, condition_type::dirichlet, &P.zero);
-        }
-        else if (x > xmax - eps)
-        {
-            P.tractionSides.push_back(*it);
-            for (index_t r=0; r<dim; ++r)
-                P.bc[r].addCondition(*it, condition_type::neumann, &P.zero);
-        }
+        const real_t x = sideMidpoint(G, *it)(0,0);
+        if (x < xmin + eps)      P.clampSides.push_back(*it);
+        else if (x > xmax - eps) P.tractionSides.push_back(*it);
     }
     GISMO_ENSURE(!P.clampSides.empty(), "No face to clamp found.");
+
+    // Neighbours (a shared vertex) and the shared edges and faces
+    {
+        const std::vector< std::vector<patchComponent> > comps = G.allComponents();
+        std::vector< std::vector<int> > adj(P.nPatches);
+        for (index_t d=0; d<3; ++d) { P.compPos[d].clear(); P.nComp[d] = 0; }
+        for (size_t c=0; c<comps.size(); ++c)
+        {
+            const std::vector<patchComponent>& g = comps[c];
+            const index_t d = g[0].dim();
+            if (d == 0)
+            {
+                for (size_t a=0; a<g.size(); ++a)
+                    for (size_t b=0; b<g.size(); ++b)
+                        if (g[a].patch() != g[b].patch())
+                            adj[g[a].patch()].push_back((int)g[b].patch());
+            }
+            else if (d < dim && g.size() > 1)
+                P.compPos[d].push_back(std::make_pair(std::make_pair((int)g[0].patch(), (int)g[0].index()),
+                                                      (int)P.nComp[d]++));
+        }
+        for (index_t d=0; d<3; ++d) std::sort(P.compPos[d].begin(), P.compPos[d].end());
+        P.nbrStart.assign(P.nPatches+1, 0);
+        P.nbr.clear();
+        for (index_t k=0; k<P.nPatches; ++k)
+        {
+            std::sort(adj[k].begin(), adj[k].end());
+            adj[k].erase(std::unique(adj[k].begin(), adj[k].end()), adj[k].end());
+            P.nbr.insert(P.nbr.end(), adj[k].begin(), adj[k].end());
+            P.nbrStart[k+1] = (int)P.nbr.size();
+            std::vector<int>().swap(adj[k]);
+        }
+    }
+    t.topo += wallTime() - t0;
+    m.topo = currentRss();
+}
+
+/// The given patches and their neighbours up to the given depth, ascending
+std::vector<index_t> ring(const Problem& P, const std::vector<index_t>& seed, int depth)
+{
+    std::vector<char> in(P.nPatches, 0);
+    std::vector<index_t> cur, all;
+    for (size_t q=0; q<seed.size(); ++q)
+        if (!in[seed[q]]) { in[seed[q]] = 1; cur.push_back(seed[q]); }
+    all = cur;
+    for (int d=0; d<depth; ++d)
+    {
+        std::vector<index_t> next;
+        for (size_t q=0; q<cur.size(); ++q)
+            for (int j=P.nbrStart[cur[q]]; j<P.nbrStart[cur[q]+1]; ++j)
+                if (!in[P.nbr[j]]) { in[P.nbr[j]] = 1; next.push_back(P.nbr[j]); }
+        all.insert(all.end(), next.begin(), next.end());
+        cur.swap(next);
+    }
+    std::sort(all.begin(), all.end());
+    return all;
+}
+
+/// Local part: patches (global indices, ascending), interfaces between them,
+/// bases, boundary conditions and the IETI mappers. Replaces a previous
+/// local part.
+void buildLocal(const Options& o, Problem& P, const std::vector<index_t>& patches, Timers& t, Memory& m)
+{
+    double t0 = wallTime();
+    const index_t dim = P.dim;
+    P.gid = patches;
+    const index_t nl = P.gid.size();
+    P.complete.assign(nl, 1);
+    for (index_t l=0; l<nl; ++l)
+        for (int j=P.nbrStart[P.gid[l]]; j<P.nbrStart[P.gid[l]+1]; ++j)
+            if (!P.isLocal(P.nbr[j])) { P.complete[l] = 0; break; }
+
+    P.mp = gsMultiPatch<>();
+    for (index_t l=0; l<nl; ++l)
+        P.mp.addPatch(P.global.patch(P.gid[l]));
+    for (gsMultiPatch<>::const_iiterator it = P.global.iBegin(); it != P.global.iEnd(); ++it)
+        if (P.isLocal(it->first().patch) && P.isLocal(it->second().patch))
+        {
+            boundaryInterface bi = *it;
+            bi.first().patch  = P.loc(it->first().patch);
+            bi.second().patch = P.loc(it->second().patch);
+            P.mp.addInterface(bi);
+        }
+    P.mp.addAutoBoundaries();
+
+    // Bases: degree o.degree, o.refine uniform refinements
+    P.mb = gsMultiBasis<>(P.mp, true);
+    for (index_t l=0; l<nl; ++l)
+        P.mb[l].setDegreePreservingMultiplicity(o.degree);
+    for (index_t i=0; i<o.refine; ++i)
+        P.mb.uniformRefine();
+
+    // Boundary conditions on the true boundary sides of the local patches
+    P.bc.assign(dim, gsBoundaryConditions<>());
+    for (size_t s=0; s<P.clampSides.size(); ++s)
+        if (P.isLocal(P.clampSides[s].patch))
+            for (index_t r=0; r<dim; ++r)
+                P.bc[r].addCondition(patchSide(P.loc(P.clampSides[s].patch), P.clampSides[s].side()),
+                                     condition_type::dirichlet, &P.zero);
+    for (size_t s=0; s<P.tractionSides.size(); ++s)
+        if (P.isLocal(P.tractionSides[s].patch))
+            for (index_t r=0; r<dim; ++r)
+                P.bc[r].addCondition(patchSide(P.loc(P.tractionSides[s].patch), P.tractionSides[s].side()),
+                                     condition_type::neumann, &P.zero);
     for (index_t r=0; r<dim; ++r)
         P.bc[r].setGeoMap(P.mp);
-
     t.basis += wallTime() - t0;
     m.basis = currentRss();
     t0 = wallTime();
 
     // IETI mappers, one per displacement component
-    P.mapper.resize(dim);
+    P.mapper.assign(dim, gsIetiMapper<>());
     for (index_t r=0; r<dim; ++r)
     {
         gsExprAssembler<> assembler;
@@ -503,66 +682,367 @@ void buildProblem(const Options& o, Problem& P, Timers& t, Memory& m)
         u.setup(P.bc[r], dirichlet::interpolation, 0);
         P.mapper[r].init(P.mb, u.mapper(), u.fixedPart());
     }
-    P.nLambda = P.nPrimal = P.nUnknowns = 0;
-    for (index_t r=0; r<dim; ++r)
-        P.nUnknowns += P.mapper[r].dofMapperGlobal().freeSize();
     t.dofmap += wallTime() - t0;
-    m.dofmap = currentRss();
 }
 
-/// Primal constraints; averages are assembled for the given patches only
-/// (all patches if the list is empty)
-void buildPrimals(Problem& P, const Options& o, const std::vector<index_t>& patches)
+/// Coupled dofs of the local dof mapper of component r: the members (local
+/// patch, basis index) of every coupled index, ascending (the order of
+/// gsIetiMapper::computeJumpMatrices), and how many of them are patch corners
+struct Groups
 {
-    const index_t dim = P.dim;
-    for (index_t r=0; r<dim; ++r)
+    std::vector<index_t> start;
+    std::vector< std::pair<index_t,index_t> > member;
+    std::vector<index_t> corners;
+    index_t size() const { return (index_t)start.size()-1; }
+    index_t members(index_t c) const { return start[c+1]-start[c]; }
+    index_t first(index_t c) const { return member[start[c]].first; }
+};
+
+Groups coupledGroups(const Problem& P, index_t r)
+{
+    const gsDofMapper& dm = P.mapper[r].dofMapperGlobal();
+    const index_t nc = dm.coupledSize(), nl = P.gid.size(), dim = P.dim;
+    Groups G;
+    G.start.assign(nc+1, 0);
+    for (index_t k=0; k<nl; ++k)
+        for (index_t i=0; i<(index_t)dm.patchSize(k); ++i)
+            if (dm.is_coupled(i,k)) ++G.start[dm.cindex(i,k)+1];
+    for (index_t c=0; c<nc; ++c) G.start[c+1] += G.start[c];
+    std::vector<index_t> fill(G.start.begin(), G.start.end()-1);
+    G.member.resize(G.start[nc]);
+    for (index_t k=0; k<nl; ++k)
+        for (index_t i=0; i<(index_t)dm.patchSize(k); ++i)
+            if (dm.is_coupled(i,k)) G.member[fill[dm.cindex(i,k)]++] = std::make_pair(k, i);
+    G.corners.assign(nc, 0);
+    for (index_t k=0; k<nl; ++k)
+        for (boxCorner it = boxCorner::getFirst(dim); it!=boxCorner::getEnd(dim); ++it)
+        {
+            const index_t idx = P.mb[k].functionAtCorner(it);
+            if (dm.is_coupled(idx,k)) ++G.corners[dm.cindex(idx,k)];
+        }
+    return G;
+}
+
+/// Whether a shared component carries an average for component r: one of
+/// its patches has a free dof on it (gsIetiMapper::interfaceAveragesAsPrimals)
+bool componentUsed(const Problem& P, index_t r, const std::vector<patchComponent>& g)
+{
+    for (size_t i=0; i<g.size(); ++i)
+    {
+        const index_t k = g[i].patch();
+        const gsDofMapper& dl = P.mapper[r].dofMapperLocal(k);
+        gsMatrix<index_t> indices;
+        P.mb[k].componentBasis_withIndices(g[i], indices, false);
+        for (index_t j=0; j<indices.size(); ++j)
+            if (dl.is_free_index(dl.index(indices(j,0),0)))
+                return true;
+    }
+    return false;
+}
+
+/// Dimensions of the averages that are primal dofs
+std::vector<index_t> averageDims(const Problem& P, const Options& o)
+{
+    std::vector<index_t> d;
+    if (o.primal != "v") d.push_back(1);
+    if (o.primal == "vef" && P.dim==3) d.push_back(2);
+    return d;
+}
+
+/// Contributions of patches to the global numbering, summed over the ranks:
+/// per component r and patch k the multipliers, vertex primal dofs and free
+/// dofs whose first occurrence lies on k; per component and shared edge or
+/// face whether it carries an average
+struct Counts
+{
+    index_t dim, N, c1, c2;
+    std::vector<long long> data;
+    explicit Counts(const Problem& P) : dim(P.dim), N(P.nPatches), c1(P.nComp[1]), c2(P.nComp[2]),
+        data(P.dim*(3*P.nPatches + P.nComp[1] + P.nComp[2]), 0) {}
+    long long& patch(index_t r, index_t k, int what) { return data[(r*N + k)*3 + what]; }
+    long long  patch(index_t r, index_t k, int what) const { return data[(r*N + k)*3 + what]; }
+    long long& used(index_t r, index_t d, index_t pos) { return data[dim*3*N + r*(c1+c2) + (d==1 ? 0 : c1) + pos]; }
+    long long  used(index_t r, index_t d, index_t pos) const { return data[dim*3*N + r*(c1+c2) + (d==1 ? 0 : c1) + pos]; }
+};
+
+/// Adds the contributions of the given local patches, which must be complete
+void countPatches(const Problem& P, const Options& o, const std::vector<index_t>& localPatches, Counts& C)
+{
+    const index_t nl = P.gid.size();
+    std::vector<char> contrib(nl, 0);
+    for (size_t q=0; q<localPatches.size(); ++q)
+    {
+        GISMO_ENSURE(P.complete[localPatches[q]], "Patch " << P.gid[localPatches[q]]
+                     << " contributes to the numbering but has neighbours that are not local.");
+        contrib[localPatches[q]] = 1;
+    }
+    const std::vector<index_t> dims = averageDims(P, o);
+    std::vector< std::vector<patchComponent> > comps;
+    if (!dims.empty()) comps = P.mp.allComponents();
+    for (index_t r=0; r<P.dim; ++r)
+    {
+        const Groups G = coupledGroups(P, r);
+        for (index_t c=0; c<G.size(); ++c)
+        {
+            if (!contrib[G.first(c)]) continue;
+            const index_t k = P.gid[G.first(c)];
+            const long long n = G.members(c);
+            C.patch(r,k,2) += 1;
+            if (G.corners[c] == 0) C.patch(r,k,0) += n*(n-1)/2;
+            if (G.corners[c] >= 2) C.patch(r,k,1) += 1;
+        }
+        const gsDofMapper& dm = P.mapper[r].dofMapperGlobal();
+        for (index_t l=0; l<nl; ++l)
+            if (contrib[l])
+                for (index_t i=0; i<(index_t)dm.patchSize(l); ++i)
+                    if (dm.is_free(i,l) && !dm.is_coupled(i,l)) C.patch(r,P.gid[l],2) += 1;
+        for (size_t q=0; q<dims.size(); ++q)
+            for (size_t c=0; c<comps.size(); ++c)
+            {
+                const std::vector<patchComponent>& g = comps[c];
+                if (g[0].dim() != dims[q] || g.size() < 2 || !contrib[g[0].patch()]) continue;
+                if (componentUsed(P, r, g))
+                    C.used(r, dims[q], P.compPosition(dims[q], P.gid[g[0].patch()], g[0].index())) = 1;
+            }
+    }
+}
+
+/// Global indices of the local multipliers and primal dofs, from the summed
+/// counts. The local indices are those of gsIetiMapper on the local patches.
+void numberLocal(Problem& P, const Options& o, const Counts& C)
+{
+    const index_t N = P.nPatches, nl = P.gid.size();
+    const std::vector<index_t> dims = averageDims(P, o);
+    std::vector< std::vector<patchComponent> > comps;
+    if (!dims.empty()) comps = P.mp.allComponents();
+    P.lambdaGlobal.assign(P.dim, std::vector<index_t>());
+    P.primalGlobal.assign(P.dim, std::vector<index_t>());
+    long long lamOff = 0, priOff = 0, unknowns = 0;
+    for (index_t r=0; r<P.dim; ++r)
+    {
+        std::vector<long long> MP(N+1, 0), VP(N+1, 0);
+        for (index_t k=0; k<N; ++k)
+        {
+            MP[k+1] = MP[k] + C.patch(r,k,0);
+            VP[k+1] = VP[k] + C.patch(r,k,1);
+            unknowns += C.patch(r,k,2);
+        }
+        // Averages: global position among the used shared components of each dimension
+        std::vector< std::vector<long long> > avgId(3);
+        long long avgBase[3] = {0, 0, 0}, nAvg = 0;
+        for (size_t q=0; q<dims.size(); ++q)
+        {
+            const index_t d = dims[q];
+            avgBase[d] = VP[N] + nAvg;
+            avgId[d].assign(P.nComp[d], -1);
+            for (index_t pos=0; pos<P.nComp[d]; ++pos)
+                if (C.used(r,d,pos)) avgId[d][pos] = nAvg++;
+        }
+
+        const Groups G = coupledGroups(P, r);
+        std::vector<long long> within(nl, 0), withinV(nl, 0);
+        std::vector<index_t>& lg = P.lambdaGlobal[r];
+        std::vector<index_t>& pg = P.primalGlobal[r];
+        for (index_t c=0; c<G.size(); ++c)
+        {
+            const index_t l0 = G.first(c), k0 = P.gid[l0];
+            const bool known = P.complete[l0];
+            const long long n = G.members(c);
+            const long long mult = G.corners[c] == 0 ? n*(n-1)/2 : 0;
+            const long long base = lamOff + MP[k0] + within[l0];
+            for (long long j=0; j<mult; ++j) lg.push_back(known ? (index_t)(base + j) : -1);
+            within[l0] += mult;
+            if (G.corners[c] >= 2)
+            {
+                pg.push_back(known ? (index_t)(priOff + VP[k0] + withinV[l0]) : -1);
+                withinV[l0] += 1;
+            }
+        }
+        for (size_t q=0; q<dims.size(); ++q)
+            for (size_t c=0; c<comps.size(); ++c)
+            {
+                const std::vector<patchComponent>& g = comps[c];
+                const index_t d = dims[q];
+                if (g[0].dim() != d || g.size() < 2 || !componentUsed(P, r, g)) continue;
+                if (!P.complete[g[0].patch()]) { pg.push_back(-1); continue; }
+                const long long id = avgId[d][P.compPosition(d, P.gid[g[0].patch()], g[0].index())];
+                GISMO_ENSURE(id >= 0, "Average on a component of patch " << P.gid[g[0].patch()]
+                             << " is not counted by its owner.");
+                pg.push_back((index_t)(priOff + avgBase[d] + id));
+            }
+        lamOff += MP[N];
+        priOff += VP[N] + nAvg;
+    }
+    GISMO_ENSURE(lamOff < std::numeric_limits<index_t>::max() && unknowns < std::numeric_limits<index_t>::max(),
+                 "Global sizes exceed index_t.");
+    P.nLambda = (index_t)lamOff;
+    P.nPrimal = (index_t)priOff;
+    P.nUnknowns = (index_t)unknowns;
+}
+
+/// Primal constraints of the given local patches (vertex values and the
+/// averages of the shared edges and faces)
+void buildPrimals(Problem& P, const Options& o, const std::vector<index_t>& localPatches)
+{
+    for (index_t r=0; r<P.dim; ++r)
     {
         P.mapper[r].cornersAsPrimals();
         if (o.primal != "v")
-            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 1, patches);
-        if (o.primal == "vef" && dim==3)
-            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 2, patches);
+            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 1, localPatches);
+        if (o.primal == "vef" && P.dim==3)
+            P.mapper[r].interfaceAveragesAsPrimals(P.mp, 2, localPatches);
+        GISMO_ENSURE(P.mapper[r].nPrimalDofs() == (index_t)P.primalGlobal[r].size(),
+                     "Primal dofs of the local mapper and of the numbering differ.");
     }
-    P.nPrimal = 0;
-    for (index_t r=0; r<dim; ++r)
-        P.nPrimal += P.mapper[r].nPrimalDofs();
 }
 
-/// Jump matrices of the given patches (all patches if the list is empty)
-void buildJumps(Problem& P, const std::vector<index_t>& patches)
+/// Jump matrices of the given local patches
+void buildJumps(Problem& P, const std::vector<index_t>& localPatches)
 {
-    P.nLambda = 0;
     for (index_t r=0; r<P.dim; ++r)
     {
-        P.mapper[r].computeJumpMatrices(true, true, patches);
-        P.nLambda += P.mapper[r].nLagrangeMultipliers();
+        P.mapper[r].computeJumpMatrices(true, true, localPatches);
+        GISMO_ENSURE(P.mapper[r].nLagrangeMultipliers() == (index_t)P.lambdaGlobal[r].size(),
+                     "Multipliers of the local mapper and of the numbering differ.");
     }
+}
+
+/// Local indices of the given global patches
+std::vector<index_t> localIndices(const Problem& P, const std::vector<index_t>& patches)
+{
+    std::vector<index_t> out(patches.size());
+    for (size_t q=0; q<patches.size(); ++q) out[q] = P.loc(patches[q]);
+    return out;
+}
+
+/// Whether the numbering of a problem built on all patches is that of
+/// gsIetiMapper (identity of local and global indices)
+bool numberingIsIdentity(const Problem& P)
+{
+    index_t lo = 0, po = 0;
+    for (index_t r=0; r<P.dim; ++r)
+    {
+        for (size_t j=0; j<P.lambdaGlobal[r].size(); ++j)
+            if (P.lambdaGlobal[r][j] != lo + (index_t)j) return false;
+        for (size_t j=0; j<P.primalGlobal[r].size(); ++j)
+            if (P.primalGlobal[r][j] != po + (index_t)j) return false;
+        lo += P.lambdaGlobal[r].size();
+        po += P.primalGlobal[r].size();
+    }
+    return lo == P.nLambda && po == P.nPrimal;
+}
+
+/// The problem on all patches with the global numbering, for the checks
+/// (serial reference, direct solve, topology); its numbering must be that
+/// of gsIetiMapper on all patches
+void buildReference(const Options& o, Problem& R, int& status, std::string& failures)
+{
+    Timers t;
+    Memory m;
+    buildGlobal(o, R, t, m);
+    std::vector<index_t> all(R.nPatches);
+    for (index_t k=0; k<R.nPatches; ++k) all[k] = k;
+    buildLocal(o, R, all, t, m);
+    Counts C(R);
+    countPatches(R, o, all, C);
+    numberLocal(R, o, C);
+    buildPrimals(R, o, std::vector<index_t>());
+    buildJumps(R, std::vector<index_t>());
+    if (!numberingIsIdentity(R)) { status = 1; failures += " numbering"; }
+}
+
+/// Free dofs of global patch k (all components) with the dofs of its
+/// clamped sides eliminated; the weight of the linkcell partition
+index_t patchFreeDofs(const Problem& P, const Options& o, index_t k)
+{
+    gsBasis<>::uPtr b = P.global.patch(k).basis().clone();
+    b->setDegreePreservingMultiplicity(o.degree);
+    for (index_t i=0; i<o.refine; ++i) b->uniformRefine();
+    std::vector<index_t> el;
+    for (size_t s=0; s<P.clampSides.size(); ++s)
+        if (P.clampSides[s].patch == k)
+        {
+            const gsMatrix<index_t> bd = b->boundary(P.clampSides[s].side());
+            el.insert(el.end(), bd.data(), bd.data()+bd.size());
+        }
+    std::sort(el.begin(), el.end());
+    el.erase(std::unique(el.begin(), el.end()), el.end());
+    return P.dim * (b->size() - (index_t)el.size());
 }
 
 //---------------------------------------------------------------------------
 // Patch-local data
 //---------------------------------------------------------------------------
 
+/// Jump matrix of global patch k (local mapper), one row per multiplier of
+/// the patch; rows receives the global indices of these rows, ascending
+JumpMatrix patchJump(const Problem& P, index_t k, std::vector<index_t>& rows)
+{
+    const index_t l = P.loc(k);
+    gsSparseEntries<real_t> se;
+    rows.clear();
+    index_t offset = 0;
+    for (index_t r=0; r<P.dim; ++r)
+    {
+        const JumpMatrix& J = P.mapper[r].jumpMatrix(l);
+        for (index_t i=0; i<J.outerSize(); ++i)
+            for (JumpMatrix::InnerIterator it(J, i); it; ++it)
+            {
+                const index_t g = P.lambdaGlobal[r][it.row()];
+                GISMO_ENSURE(g >= 0, "Multiplier of patch " << k << " has no global index.");
+                rows.push_back(g);
+                se.add(g, offset + it.col(), it.value());
+            }
+        offset += J.cols();
+    }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    for (index_t i=0; i<(index_t)se.size(); ++i)
+        se[i] = gsSparseEntries<real_t>::Triplet(
+            (index_t)(std::lower_bound(rows.begin(), rows.end(), se[i].row()) - rows.begin()),
+            se[i].col(), se[i].value());
+    JumpMatrix B(rows.size(), offset);
+    B.setFrom(se);
+    return B;
+}
+
+/// The jump matrix with the global row indices
+JumpMatrix expandRows(const JumpMatrix& B, const std::vector<index_t>& rows, index_t n)
+{
+    gsSparseEntries<real_t> se;
+    se.reserve(B.nonZeros());
+    for (index_t i=0; i<B.outerSize(); ++i)
+        for (JumpMatrix::InnerIterator it(B, i); it; ++it)
+            se.add(rows[it.row()], it.col(), it.value());
+    JumpMatrix R(n, B.cols());
+    R.setFrom(se);
+    return R;
+}
+
 struct Raw
 {
     SparseMatrix              A;
     Matrix                    f;
-    JumpMatrix                B;
+    JumpMatrix                B;        ///< one row per multiplier of the patch
+    std::vector<index_t>      rows;     ///< global index of each row of B
     std::vector<index_t>      skeleton;
     std::vector<SparseVector> constraints;
     std::vector<index_t>      primalIdx;
 };
 
+/// Stiffness matrix, right-hand side, jump matrix, skeleton and primal
+/// constraints of global patch k
 void assembleRaw(const Problem& P, index_t k, Raw& out)
 {
     const index_t dim = P.dim;
+    const index_t l = P.loc(k);
 
-    gsMultiPatch<>  mpl = P.mp[k];
-    gsMultiBasis<>  mbl(P.mb[k]);
+    gsMultiPatch<>  mpl = P.mp[l];
+    gsMultiBasis<>  mbl(P.mb[l]);
     std::vector<gsBoundaryConditions<> > bcl(dim);
     for (index_t r=0; r<dim; ++r)
     {
-        P.bc[r].getConditionsForPatch(k, bcl[r]);
+        P.bc[r].getConditionsForPatch(l, bcl[r]);
         bcl[r].setGeoMap(mpl);
     }
 
@@ -578,7 +1058,7 @@ void assembleRaw(const Problem& P, index_t k, Raw& out)
     {
         v.push_back(A.getSpace(mbl, 1, r));
         v[r].setup(bcl[r], dirichlet::interpolation, 0);
-        P.mapper[r].initFeSpace(v[r], k);
+        P.mapper[r].initFeSpace(v[r], l);
     }
     A.initSystem();
 
@@ -613,20 +1093,18 @@ void assembleRaw(const Problem& P, index_t k, Raw& out)
     out.A = A.matrix();
     out.f = A.rhs();
 
-    std::vector<JumpMatrix> jm;
-    for (index_t r=0; r<dim; ++r) jm.push_back(P.mapper[r].jumpMatrix(k));
-    out.B = blockDiagonal(jm.begin(), jm.end());
+    out.B = patchJump(P, k, out.rows);
 
     out.skeleton.clear();
     out.constraints.clear();
     out.primalIdx.clear();
-    index_t offset = 0, poffset = 0;
+    index_t offset = 0;
     const index_t n = out.A.rows();
     for (index_t r=0; r<dim; ++r)
     {
-        const std::vector<index_t> sd = P.mapper[r].skeletonDofs(k);
+        const std::vector<index_t> sd = P.mapper[r].skeletonDofs(l);
         for (size_t j=0; j<sd.size(); ++j) out.skeleton.push_back(sd[j]+offset);
-        const std::vector<SparseVector>& cond = P.mapper[r].primalConstraints(k);
+        const std::vector<SparseVector>& cond = P.mapper[r].primalConstraints(l);
         for (size_t j=0; j<cond.size(); ++j)
         {
             SparseVector tmp(n);
@@ -634,10 +1112,14 @@ void assembleRaw(const Problem& P, index_t k, Raw& out)
                 tmp[offset + it.row()] = it.value();
             out.constraints.push_back(give(tmp));
         }
-        const std::vector<index_t>& ind = P.mapper[r].primalDofIndices(k);
-        for (size_t j=0; j<ind.size(); ++j) out.primalIdx.push_back(ind[j]+poffset);
-        offset  += P.mapper[r].jumpMatrix(k).cols();
-        poffset += P.mapper[r].nPrimalDofs();
+        const std::vector<index_t>& ind = P.mapper[r].primalDofIndices(l);
+        for (size_t j=0; j<ind.size(); ++j)
+        {
+            const index_t g = P.primalGlobal[r][ind[j]];
+            GISMO_ENSURE(g >= 0, "Primal dof of patch " << k << " has no global index.");
+            out.primalIdx.push_back(g);
+        }
+        offset += P.mapper[r].jumpMatrix(l).cols();
     }
     GISMO_ASSERT(offset == n, "Local dimension mismatch on patch " << k);
 }
@@ -645,8 +1127,8 @@ void assembleRaw(const Problem& P, index_t k, Raw& out)
 /// Mass matrix of the scalar space on a patch, including all dofs
 SparseMatrix assembleMass(const Problem& P, index_t k)
 {
-    gsMultiPatch<> mpl = P.mp[k];
-    gsMultiBasis<> mbl(P.mb[k]);
+    gsMultiPatch<> mpl = P.mp[P.loc(k)];
+    gsMultiBasis<> mbl(P.mb[P.loc(k)]);
     gsBoundaryConditions<> nobc;
     nobc.setGeoMap(mpl);
     gsExprAssembler<> A(1,1);
@@ -665,10 +1147,11 @@ Matrix localCoefficients(const Problem& P, index_t k, const Matrix& u)
 {
     Matrix c;
     index_t offset = 0;
+    const index_t l = P.loc(k);
     for (index_t r=0; r<P.dim; ++r)
     {
-        const index_t sz = P.mapper[r].jumpMatrix(k).cols();
-        Matrix cr = P.mapper[r].incorporateFixedPart(k, u.middleRows(offset, sz));
+        const index_t sz = P.mapper[r].jumpMatrix(l).cols();
+        Matrix cr = P.mapper[r].incorporateFixedPart(l, u.middleRows(offset, sz));
         if (r==0) c.resize(cr.rows(), P.dim);
         c.col(r) = cr.col(0);
         offset += sz;
@@ -708,10 +1191,10 @@ std::vector<double> patchCentroids(const Problem& P)
     std::vector<double> xyz(3*P.nPatches, 0.0);
     for (index_t k=0; k<P.nPatches; ++k)
     {
-        gsMatrix<> supp = P.mp[k].support();
-        gsMatrix<> pt(P.mp.parDim(),1), x;
-        for (index_t i=0; i<P.mp.parDim(); ++i) pt(i,0) = 0.5*(supp(i,0)+supp(i,1));
-        P.mp[k].eval_into(pt, x);
+        gsMatrix<> supp = P.global[k].support();
+        gsMatrix<> pt(P.global.parDim(),1), x;
+        for (index_t i=0; i<P.global.parDim(); ++i) pt(i,0) = 0.5*(supp(i,0)+supp(i,1));
+        P.global[k].eval_into(pt, x);
         for (index_t i=0; i<x.rows(); ++i) xyz[3*k+i] = x(i,0);
     }
     return xyz;
@@ -742,7 +1225,7 @@ double patchExtent(const Problem& P)
     double e = 0;
     for (index_t k=0; k<P.nPatches; ++k)
         for (index_t d=0; d<P.dim; ++d)
-            e = std::max(e, (double)(P.mp[k].coefs().col(d).maxCoeff() - P.mp[k].coefs().col(d).minCoeff()));
+            e = std::max(e, (double)(P.global[k].coefs().col(d).maxCoeff() - P.global[k].coefs().col(d).minCoeff()));
     return e;
 }
 
@@ -769,8 +1252,7 @@ std::vector<int> ownerLinkcell(const Problem& P, const Options& o, int parts)
     std::vector<uint64_t> weight(ncell, 0);
     for (index_t k=0; k<P.nPatches; ++k)
     {
-        index_t nk = 0;
-        for (index_t r=0; r<P.dim; ++r) nk += P.mapper[r].dofMapperLocal(k).freeSize();
+        const index_t nk = patchFreeDofs(P, o, k);
         weight[pointCell[k]] += (o.cost == "n2") ? (uint64_t)nk*(uint64_t)nk : (uint64_t)nk;
     }
     GISMO_ENSURE(0 == lc_partition_weights(nxyz, weight.data(), ncell, parts,
@@ -835,7 +1317,7 @@ std::set<std::pair<int,int> > patchPairsMapper(const Problem& P)
     const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
     std::vector<std::vector<int> > groups(dm.coupledSize());
     for (index_t k=0; k<P.nPatches; ++k)
-        for (index_t i=0; i<dm.patchSize(k); ++i)
+        for (index_t i=0; i<(index_t)dm.patchSize(k); ++i)
             if (dm.is_coupled(i,k)) groups[dm.cindex(i,k)].push_back((int)k);
     std::set<std::pair<int,int> > result;
     for (size_t g=0; g<groups.size(); ++g)
@@ -899,42 +1381,38 @@ std::vector<int> ownerOf(const Problem& P, const Options& o, int size)
 
 struct PartStats { index_t cutDofs, nbrMax; double nbrAvg; index_t minPatches, maxPatches; };
 
-/// Interface size between ranks: coupled dof groups that touch more than one
-/// rank, and the number of neighbouring ranks of each rank
-PartStats partitionStats(const Problem& P, const std::vector<int>& owner, int size)
+/// Patches per rank (minimum and maximum)
+PartStats partitionStats(const std::vector<int>& owner, int size)
 {
-    const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
-    std::vector<std::vector<int> > groups(dm.coupledSize());
-    for (index_t k=0; k<P.nPatches; ++k)
-        for (index_t i=0; i<dm.patchSize(k); ++i)
-            if (dm.is_coupled(i,k)) groups[dm.cindex(i,k)].push_back(owner[k]);
     PartStats st;
-    st.cutDofs = 0;
-    std::vector<std::set<int> > nbr(size);
-    for (size_t g=0; g<groups.size(); ++g)
-    {
-        std::set<int> rk(groups[g].begin(), groups[g].end());
-        if (rk.size() > 1)
-        {
-            st.cutDofs += rk.size()-1;
-            for (std::set<int>::const_iterator a=rk.begin(); a!=rk.end(); ++a)
-                for (std::set<int>::const_iterator b=rk.begin(); b!=rk.end(); ++b)
-                    if (*a != *b) nbr[*a].insert(*b);
-        }
-    }
-    st.cutDofs *= P.dim;
-    st.nbrMax = 0; st.nbrAvg = 0;
+    st.cutDofs = -1; st.nbrMax = -1; st.nbrAvg = -1;
     std::vector<index_t> cnt(size, 0);
     for (size_t k=0; k<owner.size(); ++k) cnt[owner[k]]++;
     st.minPatches = *std::min_element(cnt.begin(), cnt.end());
     st.maxPatches = *std::max_element(cnt.begin(), cnt.end());
-    for (int r=0; r<size; ++r)
-    {
-        st.nbrMax = std::max<index_t>(st.nbrMax, nbr[r].size());
-        st.nbrAvg += nbr[r].size();
-    }
-    st.nbrAvg /= size;
     return st;
+}
+
+/// Interface size between ranks: coupled dof groups (first component) that
+/// touch more than one rank, each counted by the rank of its first patch,
+/// and the number of ranks adjacent to each rank, from the local patches
+void cutStats(const Problem& P, const std::vector<int>& owner, Par& par, PartStats& st)
+{
+    const Groups G = coupledGroups(P, 0);
+    long long cut = 0;
+    std::set<int> nb;
+    for (index_t c=0; c<G.size(); ++c)
+    {
+        std::set<int> rk;
+        for (index_t j=G.start[c]; j<G.start[c+1]; ++j) rk.insert(owner[P.gid[G.member[j].first]]);
+        if (!rk.count(par.rank)) continue;
+        for (std::set<int>::const_iterator a=rk.begin(); a!=rk.end(); ++a)
+            if (*a != par.rank) nb.insert(*a);
+        if (owner[P.gid[G.first(c)]] == par.rank) cut += rk.size()-1;
+    }
+    st.cutDofs = (index_t)par.sumOf((double)cut) * P.dim;
+    st.nbrMax  = par.maxOf((index_t)nb.size());
+    st.nbrAvg  = par.sumOf((double)nb.size()) / par.size;
 }
 
 std::vector<index_t> distribute(const std::vector<int>& owner, int rank)
@@ -965,7 +1443,7 @@ struct Dual
 {
     bool    distributed;
     index_t nGlobal, nLocal, nOwned, nShared, nNbr;
-    std::vector<index_t> glob;     ///< global index of each local multiplier, ascending
+    std::vector<index_t> glob;     ///< global index of each multiplier of the own patches, ascending: the rows of the local jump matrices
     Matrix  weight;                ///< 1 for the owned multipliers, 0 for the others
     std::vector<int> nbr;          ///< adjacent ranks, ascending
     std::vector<int> cnt, dsp;     ///< shared multipliers per adjacent rank
@@ -988,24 +1466,52 @@ struct Dual
         return (index_t)(it - glob.begin());
     }
 
-    /// Rows of a jump matrix in the numbering of this layout
-    JumpMatrix rows(const JumpMatrix& B) const
+    /// Number of rows of the local jump matrices
+    index_t nRows() const { return (index_t)glob.size(); }
+
+    /// A patch jump matrix whose row i is the global multiplier rows[i], with
+    /// the rows of the local jump matrices (the entries of glob)
+    JumpMatrix rows(const std::vector<index_t>& rows, const JumpMatrix& B) const
     {
-        if (!distributed) return B;
         gsSparseEntries<real_t> se;
         se.reserve(B.nonZeros());
         for (index_t i=0; i<B.outerSize(); ++i)
             for (JumpMatrix::InnerIterator it(B, i); it; ++it)
-                se.add(local(it.row()), it.col(), it.value());
-        JumpMatrix R(nLocal, B.cols());
+                se.add(local(rows[it.row()]), it.col(), it.value());
+        JumpMatrix R(nRows(), B.cols());
         R.setFrom(se);
         return R;
     }
 
-    /// Completes a vector of own contributions to the consistent vector
-    void accumulate(Par& par, Matrix& y) const
+    /// A vector of the layout restricted to the rows of the local jump
+    /// matrices (tmp holds the result if it is not x itself)
+    const Matrix& restrict(const Matrix& x, Matrix& tmp) const
     {
-        if (!distributed) { par.sum(y); return; }
+        if (distributed) return x;
+        tmp.resize(nRows(), x.cols());
+        for (index_t i=0; i<nRows(); ++i) tmp.row(i) = x.row(glob[i]);
+        return tmp;
+    }
+
+    /// The consistent vector y of the layout from the contributions yl of the
+    /// own patches (rows of the local jump matrices); yl is consumed
+    void accumulate(Par& par, Matrix& yl, Matrix& y) const
+    {
+        if (!distributed)
+        {
+            y.setZero(nGlobal, yl.cols());
+            for (index_t i=0; i<nRows(); ++i) y.row(glob[i]) = yl.row(i);
+            par.sum(y);
+            return;
+        }
+        y.swap(yl);
+        exchange(par, y);
+    }
+
+    /// Adds the contributions of the adjacent ranks (distributed layout)
+    void exchange(Par& par, Matrix& y) const
+    {
+        GISMO_UNUSED(par); GISMO_UNUSED(y);
 #ifdef GISMO_WITH_MPI
         if (nbr.empty()) return;
         const double t = MPI_Wtime();
@@ -1065,23 +1571,26 @@ struct Partner
     bool operator==(const Partner& o) const { return k == o.k && i == o.i && other == o.other; }
 };
 
-/// Partners from the inverse of the global dof mapper (built from all
-/// patches, on every rank)
+/// Partners from the inverse of the dof mapper of the local patches, which
+/// holds the complete groups of the coupled dofs of the own patches
 std::vector<Partner> partnersMapper(const Problem& P, const std::vector<int>& owner, int rank)
 {
     const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
     std::vector<std::vector<index_t> > groups(dm.coupledSize());
-    for (index_t k=0; k<P.nPatches; ++k)
-        for (index_t i=0; i<dm.patchSize(k); ++i)
-            if (dm.is_coupled(i,k)) groups[dm.cindex(i,k)].push_back(k);
+    const index_t nl = P.gid.size();
+    for (index_t l=0; l<nl; ++l)
+        for (index_t i=0; i<(index_t)dm.patchSize(l); ++i)
+            if (dm.is_coupled(i,l)) groups[dm.cindex(i,l)].push_back(P.gid[l]);
     std::vector<Partner> out;
-    for (index_t k=0; k<P.nPatches; ++k)
+    for (index_t l=0; l<nl; ++l)
     {
+        const index_t k = P.gid[l];
         if (owner[k] != rank) continue;
-        for (index_t i=0; i<dm.patchSize(k); ++i)
+        GISMO_ENSURE(P.complete[l], "Own patch " << k << " has neighbours that are not local.");
+        for (index_t i=0; i<(index_t)dm.patchSize(l); ++i)
         {
-            if (!dm.is_coupled(i,k)) continue;
-            const std::vector<index_t>& g = groups[dm.cindex(i,k)];
+            if (!dm.is_coupled(i,l)) continue;
+            const std::vector<index_t>& g = groups[dm.cindex(i,l)];
             for (size_t a=0; a<g.size(); ++a)
                 if (owner[g[a]] != rank)
                 { Partner p; p.k = k; p.i = i; p.other = g[a]; out.push_back(p); }
@@ -1093,7 +1602,7 @@ std::vector<Partner> partnersMapper(const Problem& P, const std::vector<int>& ow
 }
 
 /// Patches of other ranks that touch a patch of this rank, from the inverse
-/// of the global dof mapper
+/// of the dof mapper of the local patches
 std::vector<index_t> haloPatchesMapper(const Problem& P, const std::vector<int>& owner, int rank)
 {
     const std::vector<Partner> pr = partnersMapper(P, owner, rank);
@@ -1145,20 +1654,21 @@ std::vector<Partner> partnersLinkcell(const Problem& P, const std::vector<int>& 
     std::vector<Partner> out;
     if (halo.empty()) return out;
     std::vector<index_t> patches = halo;
-    for (index_t k=0; k<P.nPatches; ++k)
-        if (owner[k] == rank) patches.push_back(k);
+    for (size_t l=0; l<P.gid.size(); ++l)
+        if (owner[P.gid[l]] == rank) patches.push_back(P.gid[l]);
     std::vector<double> pts;
     std::vector<index_t> pointPatch, pointDof;
     const gsDofMapper& dm = P.mapper[0].dofMapperGlobal();
     double h = 1e300;
     for (size_t q=0; q<patches.size(); ++q)
     {
-        const index_t k = patches[q];
-        gsMatrix<> anc = P.mb[k].anchors();
+        const index_t k = patches[q], l = P.loc(k);
+        GISMO_ENSURE(P.complete[l], "Patch " << k << " of the pair search has neighbours that are not local.");
+        gsMatrix<> anc = P.mb[l].anchors();
         gsMatrix<> x;
-        P.mp[k].eval_into(anc, x);
+        P.mp[l].eval_into(anc, x);
         for (index_t i=0; i<anc.cols(); ++i)
-            if (dm.is_coupled(i,k))
+            if (dm.is_coupled(i,l))
             {
                 for (index_t d=0; d<3; ++d) pts.push_back(d<x.rows() ? x(d,i) : 0.0);
                 pointPatch.push_back(k);
@@ -1166,8 +1676,8 @@ std::vector<Partner> partnersLinkcell(const Problem& P, const std::vector<int>& 
             }
         double ext = 1e300;
         for (index_t d=0; d<P.dim; ++d)
-            ext = std::min(ext, (double)(P.mp[k].coefs().col(d).maxCoeff() - P.mp[k].coefs().col(d).minCoeff()));
-        h = std::min(h, ext / std::pow((double)P.mb[k].numElements(), 1.0/P.dim));
+            ext = std::min(ext, (double)(P.mp[l].coefs().col(d).maxCoeff() - P.mp[l].coefs().col(d).minCoeff()));
+        h = std::min(h, ext / std::pow((double)P.mb[l].numElements(), 1.0/P.dim));
     }
     const double eps = 1e-3*h;
     const lc_cell box = lcBox(pts, 2*h);
@@ -1197,17 +1707,19 @@ std::vector<Partner> partnersLinkcell(const Problem& P, const std::vector<int>& 
 }
 #endif
 
-/// Patches of other ranks that can share multipliers with this rank
-std::vector<index_t> haloPatches(const Problem& P, const Options& o, const std::vector<int>& owner,
-                                 int rank, int parts)
+/// Patches of other ranks that can share multipliers with this rank, from
+/// the linkcell search over the patch centroids; empty for
+/// --dual-neighbours=mapper, which reads them from the local dof mapper
+std::vector<index_t> haloPatchesSearch(const Problem& P, const Options& o, const std::vector<int>& owner,
+                                       int rank, int parts)
 {
 #ifdef IETI_WITH_LINKCELL
     if (o.dualNeighbours == "linkcell") return haloPatchesLinkcell(P, owner, rank, parts);
 #endif
     GISMO_ENSURE(o.dualNeighbours == "mapper", "--dual-neighbours=" << o.dualNeighbours
                  << " is not available (mapper, or linkcell with GISMO_WITH_LINKCELL).");
-    GISMO_UNUSED(parts);
-    return haloPatchesMapper(P, owner, rank);
+    GISMO_UNUSED(P); GISMO_UNUSED(owner); GISMO_UNUSED(rank); GISMO_UNUSED(parts);
+    return std::vector<index_t>();
 }
 
 /// Global rows of the multipliers of a patch: all rows, and the rows per
@@ -1222,18 +1734,19 @@ PatchRows patchRows(const Problem& P, index_t k, bool withColumns)
 {
     PatchRows pr;
     pr.byCol.resize(P.dim);
-    index_t rowOff = 0;
+    const index_t l = P.loc(k);
     for (index_t r=0; r<P.dim; ++r)
     {
-        const JumpMatrix& J = P.mapper[r].jumpMatrix(k);
+        const JumpMatrix& J = P.mapper[r].jumpMatrix(l);
         if (withColumns) pr.byCol[r].resize(J.cols());
         for (index_t i=0; i<J.outerSize(); ++i)
             for (JumpMatrix::InnerIterator it(J, i); it; ++it)
             {
-                pr.all.push_back(rowOff + it.row());
-                if (withColumns) pr.byCol[r][it.col()].push_back(rowOff + it.row());
+                const index_t g = P.lambdaGlobal[r][it.row()];
+                GISMO_ENSURE(g >= 0, "Multiplier of patch " << k << " has no global index.");
+                pr.all.push_back(g);
+                if (withColumns) pr.byCol[r][it.col()].push_back(g);
             }
-        rowOff += P.mapper[r].nLagrangeMultipliers();
     }
     std::sort(pr.all.begin(), pr.all.end());
     pr.all.erase(std::unique(pr.all.begin(), pr.all.end()), pr.all.end());
@@ -1252,7 +1765,7 @@ PatchRows patchRows(const Problem& P, index_t k, bool withColumns)
 /// With emulate > 0 (one process, rank 0 of emulate ranks) the lists of the
 /// other side are the rows of the jump matrices of the halo patches, which
 /// the caller has built.
-Dual buildDual(const Problem& P, const Options& o, Par& par, const std::vector<int>& owner,
+Dual buildDual(const Problem& P, const Problem& Pchk, const Options& o, Par& par, const std::vector<int>& owner,
                const std::vector<index_t>& mine, const std::vector<index_t>& halo, int& status,
                std::string& failures)
 {
@@ -1261,6 +1774,13 @@ Dual buildDual(const Problem& P, const Options& o, Par& par, const std::vector<i
     D.distributed = (o.multipliers == "distributed");
     if (!D.distributed)
     {
+        for (size_t m=0; m<mine.size(); ++m)
+        {
+            const PatchRows pr = patchRows(P, mine[m], false);
+            D.glob.insert(D.glob.end(), pr.all.begin(), pr.all.end());
+        }
+        std::sort(D.glob.begin(), D.glob.end());
+        D.glob.erase(std::unique(D.glob.begin(), D.glob.end()), D.glob.end());
         D.nLocal = D.nOwned = P.nLambda;
         return D;
     }
@@ -1277,13 +1797,13 @@ Dual buildDual(const Problem& P, const Options& o, Par& par, const std::vector<i
             // The pair search must find the couplings of the dof mapper, on
             // every rank: the counts are summed, so that rank 0 reports a
             // mismatch of any rank, and each rank with a mismatch prints it.
-            const std::vector<Partner> ref = partnersMapper(P, owner, rank);
+            const std::vector<Partner> ref = partnersMapper(Pchk, owner, rank);
             std::vector<Partner> missing, extra;
             std::set_difference(ref.begin(), ref.end(), partners.begin(), partners.end(),
                                 std::back_inserter(missing));
             std::set_difference(partners.begin(), partners.end(), ref.begin(), ref.end(),
                                 std::back_inserter(extra));
-            const std::vector<index_t> refHalo = haloPatchesMapper(P, owner, rank);
+            const std::vector<index_t> refHalo = haloPatchesMapper(Pchk, owner, rank);
             std::vector<index_t> haloMissing;
             std::set_difference(refHalo.begin(), refHalo.end(), halo.begin(), halo.end(),
                                 std::back_inserter(haloMissing));
@@ -1324,7 +1844,7 @@ Dual buildDual(const Problem& P, const Options& o, Par& par, const std::vector<i
             std::vector<long long>& c = cand[owner[partners[q].other]];
             for (index_t r=0; r<P.dim; ++r)
             {
-                const gsDofMapper& dl = P.mapper[r].dofMapperLocal(k);
+                const gsDofMapper& dl = P.mapper[r].dofMapperLocal(P.loc(k));
                 if (!dl.is_free(partners[q].i, 0)) continue;
                 const std::vector<index_t>& rows = pr.byCol[r][dl.index(partners[q].i, 0)];
                 c.insert(c.end(), rows.begin(), rows.end());
@@ -1474,7 +1994,7 @@ struct InnerStats
     InnerStats() : dirCalls(0), dirIters(0), conCalls(0), conIters(0) {}
 };
 
-/// Sides (1..2*dim) of patch k that carry a clamp and/or an interface
+/// Sides (1..2*dim) of global patch k that carry a clamp and/or an interface
 std::vector<int> patchSides(const Problem& P, index_t k, bool clamp, bool ifc)
 {
     std::set<int> sides;
@@ -1482,7 +2002,7 @@ std::vector<int> patchSides(const Problem& P, index_t k, bool clamp, bool ifc)
         for (size_t i=0; i<P.clampSides.size(); ++i)
             if (P.clampSides[i].patch == k) sides.insert((int)P.clampSides[i].side());
     if (ifc)
-        for (gsMultiPatch<>::const_iiterator it = P.mp.iBegin(); it != P.mp.iEnd(); ++it)
+        for (gsMultiPatch<>::const_iiterator it = P.global.iBegin(); it != P.global.iEnd(); ++it)
         {
             if (it->first().patch == k)  sides.insert((int)it->first().side());
             if (it->second().patch == k) sides.insert((int)it->second().side());
@@ -1680,7 +2200,7 @@ OpPtr makeNeumannFd(const Problem& P, index_t k)
     real_t vol = 1, emax = 0;
     for (index_t d=0; d<dim; ++d)
     {
-        e[d] = P.mp[k].coefs().col(d).maxCoeff() - P.mp[k].coefs().col(d).minCoeff();
+        e[d] = P.global[k].coefs().col(d).maxCoeff() - P.global[k].coefs().col(d).minCoeff();
         vol *= e[d];
         emax = std::max(emax, e[d]);
     }
@@ -1693,7 +2213,7 @@ OpPtr makeNeumannFd(const Problem& P, index_t k)
         for (index_t d=0; d<dim; ++d)
             beta[d] = (P.mu + (c==d ? P.lambda+P.mu : 0.0)) * vol / (e[d]*e[d]);
         blk->addOperator(c, c, gsPatchPreconditionersCreator<>::fastDiagonalizationOp(
-            P.mb[k], bc[c], gsAssembler<>::defaultOptions(), alpha, beta));
+            P.mb[P.loc(k)], bc[c], gsAssembler<>::defaultOptions(), alpha, beta));
     }
     return blk;
 }
@@ -1703,8 +2223,8 @@ OpPtr makeNeumannFd(const Problem& P, index_t k)
 OpPtr makeDirichletFd(const Problem& P, index_t k)
 {
     return gsPatchPreconditionersCreator<>::elasticityFastDiagonalizationOp(
-        P.mb[k], sidesAsBc(P, patchSides(P, k, true, true)), gsAssembler<>::defaultOptions(),
-        P.lambda, P.mu, &P.mp[k]);
+        P.mb[P.loc(k)], sidesAsBc(P, patchSides(P, k, true, true)), gsAssembler<>::defaultOptions(),
+        P.lambda, P.mu, &P.mp[P.loc(k)]);
 }
 
 /// Direct solver of a sparse matrix as a linear operator
@@ -1743,27 +2263,27 @@ struct CoarsePattern
 
     CoarsePattern(index_t n, const std::vector<int>& lists)
     {
+        // The patches (position of their list) that hold each primal dof
         std::vector<int> cnt(n+1, 0);
         for (size_t q=0; q<lists.size(); q += 1+lists[q])
             for (int a=0; a<lists[q]; ++a)
-                cnt[lists[q+1+a]+1] += lists[q];
+                ++cnt[lists[q+1+a]+1];
         for (index_t i=0; i<n; ++i) cnt[i+1] += cnt[i];
-        std::vector<int> fill(cnt.begin(), cnt.end()-1), all(cnt[n]);
+        std::vector<int> fill(cnt.begin(), cnt.end()-1), holder(cnt[n]);
         for (size_t q=0; q<lists.size(); q += 1+lists[q])
             for (int a=0; a<lists[q]; ++a)
-            {
-                const int r = lists[q+1+a];
-                std::copy(lists.begin()+q+1, lists.begin()+q+1+lists[q], all.begin()+fill[r]);
-                fill[r] += lists[q];
-            }
+                holder[fill[lists[q+1+a]]++] = (int)q;
+        // Row i: the union of the lists of its patches
         start.assign(n+1, 0);
-        col.reserve(all.size()/2);
+        std::vector<int> row;
         for (index_t i=0; i<n; ++i)
         {
-            std::vector<int>::iterator b = all.begin()+cnt[i], e = all.begin()+cnt[i+1];
-            std::sort(b, e);
-            e = std::unique(b, e);
-            col.insert(col.end(), b, e);
+            row.clear();
+            for (int h=cnt[i]; h<cnt[i+1]; ++h)
+                row.insert(row.end(), lists.begin()+holder[h]+1, lists.begin()+holder[h]+1+lists[holder[h]]);
+            std::sort(row.begin(), row.end());
+            row.erase(std::unique(row.begin(), row.end()), row.end());
+            col.insert(col.end(), row.begin(), row.end());
             start[i+1] = (int)col.size();
         }
     }
@@ -1868,6 +2388,8 @@ private:
     }
     void setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj,
                      const std::vector<double>& tv, Timers& t);
+    void setupCoarseRoot(const std::vector<int>& lists, const std::vector<double>& values,
+                         SparseMatrix& Ac) const;
 
     const Problem&      m_P;
     Par&                m_par;
@@ -1909,7 +2431,7 @@ void IetiMpi::setup(Timers& t, Memory& mem)
         t.assembly += wallTime() - t0;
 
         t0 = wallTime();
-        raw.B = m_dual.rows(raw.B);
+        raw.B = m_dual.rows(raw.rows, raw.B);
         OwnedPatch p;
         p.k = k;
         p.n = raw.A.rows();
@@ -2067,7 +2589,7 @@ void IetiMpi::setup(Timers& t, Memory& mem)
     m_precLocalOp = m_precLocal.preconditioner();
 
     Matrix d;
-    d.setZero(m_dual.nLocal, 1);
+    d.setZero(m_dual.nRows(), 1);
     for (size_t i=0; i<m_patches.size(); ++i)
     {
         const OwnedPatch& p = m_patches[i];
@@ -2086,16 +2608,18 @@ void IetiMpi::setup(Timers& t, Memory& mem)
             d += p.B * (p.Psi * yl);
         }
     }
-    m_dual.accumulate(m_par, d);
-    m_rhs = d;
+    m_dual.accumulate(m_par, d, m_rhs);
     t.rhs += wallTime() - t0;
 }
 
 /// Assembles and factorizes the coarse matrix from the local triplets
 /// (ti, tj, tv) of all ranks. --coarse=gather gathers the triplets on all
-/// ranks; --coarse=reduce gathers the primal indices of all patches, builds the
-/// sparsity pattern on every rank and sums the values with one reduction.
-/// With --coarse-on=root only rank 0 receives the matrix and factorizes it.
+/// ranks. --coarse=reduce with --coarse-on=all gathers the primal indices of
+/// all patches, builds the sparsity pattern on every rank and sums the values
+/// with one reduction; with --coarse-on=root only rank 0 receives the primal
+/// indices, builds the pattern and adds the dense blocks of one rank after
+/// the other, so that no other rank holds data of the size of the coarse
+/// matrix.
 void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj,
                           const std::vector<double>& tv, Timers& t)
 {
@@ -2125,13 +2649,23 @@ void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj
             for (size_t a=0; a<m_patches[q].pdof.size(); ++a)
                 lists.push_back((int)m_patches[q].pdof[a]);
         }
+        if (m_opt.coarseRoot)
+        {
+            setupCoarseRoot(lists, tv, Ac);
+            Ac.makeCompressed();
+            t.cassemble += wallTime() - t0;
+            t0 = wallTime();
+            if (haveMatrix)
+                m_coarse = makeCoarseSolver(Ac, m_opt.coarseSolver);
+            t.cfactor += wallTime() - t0;
+            return;
+        }
         const CoarsePattern pat(nPrimal, m_par.gather(lists));
         Matrix val;
         val.setZero(pat.nnz(), 1);
         for (size_t i=0; i<tv.size(); ++i)
             val(pat.pos(ti[i], tj[i]), 0) += tv[i];
-        if (m_opt.coarseRoot) m_par.sumToRoot(val);
-        else                  m_par.sum(val);
+        m_par.sum(val);
         if (haveMatrix)
         {
             gsSparseEntries<real_t> se;
@@ -2151,10 +2685,67 @@ void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj
     t.cfactor += wallTime() - t0;
 }
 
-void IetiMpi::applySchur(const Matrix& x, Matrix& y) const
+/// Coarse matrix on rank 0 from the primal indices (lists) and the dense
+/// blocks (values, row by row per patch) of all ranks; the blocks of rank q
+/// are received after those of rank q-1
+void IetiMpi::setupCoarseRoot(const std::vector<int>& lists, const std::vector<double>& values,
+                              SparseMatrix& Ac) const
 {
     const index_t nPrimal = m_P.nPrimal;
-    y.setZero(m_dual.nLocal, 1);
+    const std::vector<int> all = m_par.gatherToRoot(lists);
+    std::vector<int> len(1, (int)lists.size());
+    len = m_par.gatherToRoot(len);
+    if (m_par.rank != 0)
+    {
+#ifdef GISMO_WITH_MPI
+        MPI_Send(values.data(), (int)values.size(), MPI_DOUBLE, 0, 77, m_par.comm);
+#endif
+        return;
+    }
+    const CoarsePattern pat(nPrimal, all);
+    std::vector<double> val(pat.nnz(), 0.0), buf;
+    size_t p = 0;
+    for (int q=0; q<m_par.size; ++q)
+    {
+        const std::vector<double>* v = &values;
+#ifdef GISMO_WITH_MPI
+        if (q > 0)
+        {
+            MPI_Status st;
+            int n = 0;
+            MPI_Probe(q, 77, m_par.comm, &st);
+            MPI_Get_count(&st, MPI_DOUBLE, &n);
+            buf.resize(n);
+            MPI_Recv(buf.data(), n, MPI_DOUBLE, q, 77, m_par.comm, MPI_STATUS_IGNORE);
+            v = &buf;
+        }
+#endif
+        size_t t = 0;
+        const size_t end = p + len[q];
+        for (; p < end; p += 1+all[p])
+        {
+            const int m = all[p];
+            for (int a=0; a<m; ++a)
+                for (int b=0; b<m; ++b)
+                    val[pat.pos(all[p+1+a], all[p+1+b])] += (*v)[t++];
+        }
+        GISMO_ENSURE(t == v->size(), "Coarse blocks of rank " << q << " do not match its primal indices.");
+    }
+    gsSparseEntries<real_t> se;
+    se.reserve(pat.nnz());
+    for (index_t r=0; r<nPrimal; ++r)
+        for (int c=pat.start[r]; c<pat.start[r+1]; ++c)
+            se.add(r, pat.col[c], val[c]);
+    Ac.resize(nPrimal, nPrimal);
+    Ac.setFrom(se);
+}
+
+void IetiMpi::applySchur(const Matrix& xin, Matrix& y) const
+{
+    const index_t nPrimal = m_P.nPrimal;
+    Matrix tmp, yl;
+    const Matrix& x = m_dual.restrict(xin, tmp);
+    yl.setZero(m_dual.nRows(), 1);
     Matrix g;
     g.setZero(nPrimal, 1);
 
@@ -2164,7 +2755,7 @@ void IetiMpi::applySchur(const Matrix& x, Matrix& y) const
         Matrix w = p.B.transpose() * x;
         Matrix s;
         p.solver->apply(p.E * w, s);
-        y += p.B * (p.E.transpose() * s);
+        yl += p.B * (p.E.transpose() * s);
         if (nPrimal > 0)
         {
             Matrix gl = p.Psi.transpose() * w;
@@ -2178,22 +2769,25 @@ void IetiMpi::applySchur(const Matrix& x, Matrix& y) const
         for (size_t i=0; i<m_patches.size(); ++i)
         {
             const OwnedPatch& p = m_patches[i];
-            Matrix yl(p.pdof.size(), 1);
-            for (size_t a=0; a<p.pdof.size(); ++a) yl(a,0) = yc(p.pdof[a],0);
-            y += p.B * (p.Psi * yl);
+            Matrix yc_l(p.pdof.size(), 1);
+            for (size_t a=0; a<p.pdof.size(); ++a) yc_l(a,0) = yc(p.pdof[a],0);
+            yl += p.B * (p.Psi * yc_l);
         }
     }
-    m_dual.accumulate(m_par, y);
+    m_dual.accumulate(m_par, yl, y);
 }
 
-void IetiMpi::applyPrec(const Matrix& x, Matrix& y) const
+void IetiMpi::applyPrec(const Matrix& xin, Matrix& y) const
 {
-    m_precLocalOp->apply(x, y);
-    m_dual.accumulate(m_par, y);
+    Matrix tmp, yl;
+    m_precLocalOp->apply(m_dual.restrict(xin, tmp), yl);
+    m_dual.accumulate(m_par, yl, y);
 }
 
-std::vector<Matrix> IetiMpi::reconstruct(const Matrix& lambda) const
+std::vector<Matrix> IetiMpi::reconstruct(const Matrix& lambdaIn) const
 {
+    Matrix tmp;
+    const Matrix& lambda = m_dual.restrict(lambdaIn, tmp);
     const index_t nPrimal = m_P.nPrimal;
     Matrix g;
     g.setZero(nPrimal, 1);
@@ -2311,6 +2905,7 @@ void libraryReference(const Problem& P, const Options& o, Reference& ref)
     {
         Raw raw;
         assembleRaw(P, k, raw);
+        raw.B = expandRows(raw.B, raw.rows, P.nLambda);
         {
             gsScaledDirichletPrec<>::Blocks blocks =
                 gsScaledDirichletPrec<>::matrixBlocks(raw.A, raw.skeleton);
@@ -2403,12 +2998,12 @@ int main(int argc, char* argv[])
     cmd.addSwitch("q", "quiet",     "Print only the result line", o.quiet);
     cmd.addString("",  "tag",       "Label copied to the result line", o.tag);
     cmd.addSwitch("",  "setup-only", "Stop after the coarse problem and print the timing split of the setup", o.setupOnly);
-    cmd.addInt   ("",  "emulate-ranks", "With --setup-only on one rank: build the mapper for the patches that rank 0 of this many ranks owns and stop after the mapper phase", o.emulateRanks);
-    cmd.addString("",  "coarse",    "Assembly of the coarse matrix: gather (triplets on all ranks) or reduce (pattern from the primal indices, one reduction of the values)", o.coarse);
+    cmd.addInt   ("",  "emulate-ranks", "With --setup-only on one rank: build the local patches of rank 0 of this many ranks (the counts of the other ranks for the global numbering are built one rank at a time) and stop after the mapper phase", o.emulateRanks);
+    cmd.addString("",  "coarse",    "Assembly of the coarse matrix: gather (triplets on all ranks) or reduce (pattern from the primal indices; with --coarse-on=root the dense blocks are added on rank 0, with --coarse-on=all the values are summed with one reduction)", o.coarse);
     cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD ordering) or ldlt (SimplicialLDLT, AMD ordering)", o.coarseSolver);
     cmd.addString("",  "coarse-on", "Where the coarse matrix is factorized: root (rank 0, the coarse solutions are broadcast) or all (every rank)", o.coarseOn);
     cmd.addString("",  "multipliers", "Multiplier vector: replicated (every rank holds all multipliers, one reduction per operator application) or distributed (a rank holds the multipliers of its patches, one neighbourhood exchange per operator application)", o.multipliers);
-    cmd.addString("",  "dual-neighbours", "Neighbour search of --multipliers=distributed: linkcell (halo cells and pair search over the own and the halo patches; needs GISMO_WITH_LINKCELL) or mapper (inverse of the global dof mapper over all patches)", o.dualNeighbours);
+    cmd.addString("",  "dual-neighbours", "Neighbour search of --multipliers=distributed: linkcell (halo cells and pair search over the own and the halo patches; needs GISMO_WITH_LINKCELL) or mapper (inverse of the dof mapper of the local patches)", o.dualNeighbours);
     try { cmd.getValues(argc, argv); } catch (int rv) { return rv; }
     GISMO_ENSURE(o.multipliers == "replicated" || o.multipliers == "distributed",
                  "--multipliers is replicated or distributed.");
@@ -2422,11 +3017,10 @@ int main(int argc, char* argv[])
     int status = 0;
     std::string failures;
 
-    // Problem setup (replicated)
+    // Global part of the problem (every rank): patches, topology, neighbours
     Problem P;
     double t0 = wallTime();
-    buildProblem(o, P, tm, mem);
-    tm.mapper = wallTime() - t0;
+    buildGlobal(o, P, tm, mem);
     GISMO_ENSURE(o.emulateRanks == 0 || (o.setupOnly && par.size == 1),
                  "--emulate-ranks needs --setup-only and one MPI rank.");
 
@@ -2443,6 +3037,7 @@ int main(int argc, char* argv[])
 
     double tPart0 = wallTime();
     const int parts = o.emulateRanks > 0 ? (int)o.emulateRanks : par.size;
+    const bool emulate = o.emulateRanks > 0;
     const std::vector<int> owner = ownerOf(P, o, parts);
     const double tPartition = wallTime() - tPart0;
     if (o.checkTopology)
@@ -2456,42 +3051,96 @@ int main(int argc, char* argv[])
             std::cout << "# owner-differs rank=" << par.rank << " signature=" << sig << std::endl;
         }
     }
-    const PartStats pst = partitionStats(P, owner, parts);
+    PartStats pst = partitionStats(owner, parts);
     GISMO_ENSURE(pst.minPatches > 0, "Partition leaves a rank without patches.");
     std::vector<index_t> mine = distribute(owner, par.rank);
-    // The jump matrices of the foreign patches are not stored unless a check
-    // needs the serial reference.
-    t0 = wallTime();
-    const std::vector<index_t> subset = (o.check || o.checkDirect) ? std::vector<index_t>() : mine;
-    buildPrimals(P, o, subset);
-    tm.primals += wallTime() - t0;
-    mem.primals = currentRss();
+
+    // Patches of other ranks near the own ones from the linkcell search
+    // (distributed multipliers)
+    const bool distributed = (o.multipliers == "distributed");
     double t1 = wallTime();
-    // Patches of other ranks near the own ones (distributed multipliers)
-    std::vector<index_t> halo;
-    if (o.multipliers == "distributed")
-        halo = haloPatches(P, o, owner, par.rank, parts);
+    std::vector<index_t> haloSearch;
+    if (distributed)
+        haloSearch = haloPatchesSearch(P, o, owner, par.rank, parts);
+    tm.dual += wallTime() - t1;
+
+    // Contributions of the other ranks to the global numbering; the
+    // emulation of one rank builds them one rank at a time
+    Counts counts(P);
+    if (emulate)
+    {
+        Timers tq;
+        Memory mq;
+        for (int q=1; q<parts; ++q)
+        {
+            const std::vector<index_t> own = distribute(owner, q);
+            buildLocal(o, P, ring(P, own, 1), tq, mq);
+            countPatches(P, o, localIndices(P, own), counts);
+        }
+    }
+
+    // Local part: the own patches and two layers of neighbours, so that the
+    // coupled dofs of the own patches and of their neighbours have complete
+    // groups (one more layer for the emulation, which reads the multipliers
+    // of the halo patches)
+    {
+        std::vector<index_t> local = ring(P, mine, emulate ? 3 : 2);
+        if (!haloSearch.empty())
+        {
+            const std::vector<index_t> h = ring(P, haloSearch, emulate ? 2 : 1);
+            local.insert(local.end(), h.begin(), h.end());
+            std::sort(local.begin(), local.end());
+            local.erase(std::unique(local.begin(), local.end()), local.end());
+        }
+        buildLocal(o, P, local, tm, mem);
+    }
+    t1 = wallTime();
+    const std::vector<index_t> mineLocal = localIndices(P, mine);
+    countPatches(P, o, mineLocal, counts);
+    par.sumAll(counts.data);
+    numberLocal(P, o, counts);
+    tm.dofmap += wallTime() - t1;
+    mem.dofmap = currentRss();
+
+    t1 = wallTime();
+    buildPrimals(P, o, mineLocal);
+    tm.primals += wallTime() - t1;
+    mem.primals = currentRss();
+
+    t1 = wallTime();
+    std::vector<index_t> halo = haloSearch;
+    if (distributed && o.dualNeighbours == "mapper")
+        halo = haloPatchesMapper(P, owner, par.rank);
     tm.dual += wallTime() - t1;
     t1 = wallTime();
     {
-        // The emulation of one rank reads the multipliers of the halo patches
-        std::vector<index_t> jumpSet = subset;
-        if (!jumpSet.empty() && o.emulateRanks > 0)
-        {
-            jumpSet.insert(jumpSet.end(), halo.begin(), halo.end());
-            std::sort(jumpSet.begin(), jumpSet.end());
-        }
-        buildJumps(P, jumpSet);
+        std::vector<index_t> jumpSet = mine;
+        if (emulate) jumpSet.insert(jumpSet.end(), halo.begin(), halo.end());
+        std::sort(jumpSet.begin(), jumpSet.end());
+        buildJumps(P, localIndices(P, jumpSet));
     }
     tm.jumps += wallTime() - t1;
     mem.jumps = currentRss();
-    tm.mapper += wallTime() - t0;
+    tm.mapper = wallTime() - t0;
+
+    // The problem on all patches, on every rank, for the checks
+    Problem R;
+    const bool needReference = o.check || o.checkDirect || o.checkTopology;
+    if (needReference)
+    {
+        buildReference(o, R, status, failures);
+        if (R.nLambda != P.nLambda || R.nPrimal != P.nPrimal || R.nUnknowns != P.nUnknowns)
+        { status = 1; failures += " numbering-sizes"; }
+    }
+
     t1 = wallTime();
-    const Dual dual = buildDual(P, o, par, owner, mine, halo, status, failures);
+    const Dual dual = buildDual(P, needReference ? R : P, o, par, owner, mine, halo, status, failures);
     tm.dual += wallTime() - t1;
     mem.dual = currentRss();
     if (par.maxOf((index_t)status) != 0 && status == 0)
     { status = 1; failures += " dual-layout-on-another-rank"; }
+    if (!emulate) cutStats(P, owner, par, pst);
+
 
     // Timing split of the setup (maximum over the ranks)
     struct SetupReport
@@ -2530,10 +3179,10 @@ int main(int argc, char* argv[])
             std::vector<JumpMatrix> Brep, Bloc;
             for (size_t q=0; q<mine.size(); ++q)
             {
-                std::vector<JumpMatrix> jm;
-                for (index_t r=0; r<P.dim; ++r) jm.push_back(P.mapper[r].jumpMatrix(mine[q]));
-                Brep.push_back(blockDiagonal(jm.begin(), jm.end()));
-                Bloc.push_back(dual.rows(Brep.back()));
+                std::vector<index_t> rows;
+                const JumpMatrix B = patchJump(P, mine[q], rows);
+                Brep.push_back(expandRows(B, rows, P.nLambda));
+                Bloc.push_back(dual.rows(rows, B));
             }
             const index_t reps = 20;
             const double tRep = dualKernelTime(Brep, P.nLambda, reps);
@@ -2636,7 +3285,7 @@ int main(int argc, char* argv[])
     if (o.check)
     {
         Reference ref;
-        libraryReference(P, o, ref);
+        libraryReference(R, o, ref);
         Matrix Fref;
         ref.schur->apply(dual.global(par, lambda), Fref);
         chkMult = (Fref - ref.rhs).norm() / ref.rhs.norm();
@@ -2647,17 +3296,17 @@ int main(int argc, char* argv[])
         cref(0,0) = 0;
         Matrix lref(1,1);
         lref(0,0) = 0;
-        for (index_t k=0; k<P.nPatches; ++k)
+        for (index_t k=0; k<R.nPatches; ++k)
         {
-            SparseMatrix M = assembleMass(P, k);
-            Matrix cf = localCoefficients(P, k, ref.u[k]);
+            SparseMatrix M = assembleMass(R, k);
+            Matrix cf = localCoefficients(R, k, ref.u[k]);
             lref(0,0) += squaredL2(M, cf);
         }
         // reference compliance needs the local right-hand sides
-        for (index_t k=0; k<P.nPatches; ++k)
+        for (index_t k=0; k<R.nPatches; ++k)
         {
             Raw raw;
-            assembleRaw(P, k, raw);
+            assembleRaw(R, k, raw);
             cref(0,0) += raw.f.col(0).dot(ref.u[k].col(0));
         }
         const real_t l2ref = std::sqrt(lref(0,0));
@@ -2675,14 +3324,14 @@ int main(int argc, char* argv[])
         std::vector<real_t> tr = P.traction;
         gsConstantFunction<> g(gsVector<>::Map(tr.data(), dim), dim);
         gsBoundaryConditions<> bcInfo;
-        for (size_t s=0; s<P.clampSides.size(); ++s)
+        for (size_t s=0; s<R.clampSides.size(); ++s)
             for (index_t d=0; d<dim; ++d)
-                bcInfo.addCondition(P.clampSides[s].patch, P.clampSides[s],
+                bcInfo.addCondition(R.clampSides[s].patch, R.clampSides[s],
                                     condition_type::dirichlet, 0, d);
-        for (size_t s=0; s<P.tractionSides.size(); ++s)
-            bcInfo.addCondition(P.tractionSides[s].patch, P.tractionSides[s],
+        for (size_t s=0; s<R.tractionSides.size(); ++s)
+            bcInfo.addCondition(R.tractionSides[s].patch, R.tractionSides[s],
                                 condition_type::neumann, &g);
-        gsElasticityAssembler<real_t> assembler(P.mp, P.mb, bcInfo, body);
+        gsElasticityAssembler<real_t> assembler(R.mp, R.mb, bcInfo, body);
         assembler.options().setReal("YoungsModulus", o.young);
         assembler.options().setReal("PoissonsRatio", o.poisson);
         assembler.assemble();
@@ -2717,12 +3366,12 @@ int main(int argc, char* argv[])
     std::string topo = "NA";
     if (o.checkTopology)
     {
-        const std::set<std::pair<int,int> > viaMapper = patchPairsMapper(P);
-        const std::set<std::pair<int,int> > viaTopo   = patchPairsTopology(P);
+        const std::set<std::pair<int,int> > viaMapper = patchPairsMapper(R);
+        const std::set<std::pair<int,int> > viaTopo   = patchPairsTopology(R);
         bool ok = std::includes(viaMapper.begin(), viaMapper.end(), viaTopo.begin(), viaTopo.end());
 #ifdef IETI_WITH_LINKCELL
         size_t nDofPairs = 0;
-        const std::set<std::pair<int,int> > viaLc = patchPairsLinkcell(P, o, nDofPairs);
+        const std::set<std::pair<int,int> > viaLc = patchPairsLinkcell(R, o, nDofPairs);
         lcPairs = (index_t)viaLc.size();
         ok = ok && (viaLc == viaMapper);
         if (par.rank == 0)
