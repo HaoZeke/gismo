@@ -35,6 +35,12 @@
     assembled on rank 0 from the dense blocks of all ranks, received one rank
     after the other, and factorized there; rank 0 broadcasts the coarse
     solutions (--coarse-on=all assembles and factorizes it on every rank).
+    With --coarse-on=distributed no rank assembles the coarse matrix: every
+    rank keeps the coarse blocks of its patches and the coarse problem is
+    solved by all ranks together with a conjugate gradient iteration,
+    preconditioned with the inverse diagonal, whose vectors hold the primal
+    dofs of the own patches and are completed with one neighbourhood
+    exchange per product (options --coarse-tol, --coarse-maxit).
     Because the conjugate gradient iteration only acts on replicated vectors,
     gsConjugateGradient is used unchanged.
 
@@ -338,7 +344,9 @@ struct Options
     std::string coarse;        // gather (triplets to all ranks) or reduce (pattern from the primal indices)
     std::string coarseSolver;  // lu (SparseLU, COLAMD) or ldlt (SimplicialLDLT, AMD)
     bool    coarseRoot;        // factorize the coarse matrix on rank 0 only and broadcast its solutions
-    std::string coarseOn;      // root or all: where the coarse matrix is factorized
+    std::string coarseOn;      // root, all or distributed: where the coarse problem is solved
+    real_t  coarseTol;         // relative residual of the distributed coarse solve
+    index_t coarseMaxIt;
     std::string multipliers;   // replicated (one reduction per application) or distributed (neighbour exchange)
     std::string dualNeighbours; // linkcell (halo and pair search) or mapper (inverse of the local dof mapper)
     real_t  gateMult, gateL2, gateComp, gateDirectL2, gateDirectComp;
@@ -2252,21 +2260,135 @@ private:
 class LeanSparseLU : public gsSparseSolver<real_t>::LU
 {
 public:
-    template<class M> void compute(const M& A)
+    LeanSparseLU& compute(const gsSparseMatrix<real_t>& A)
     {
         gsSparseSolver<real_t>::LU::compute(A);
         const index_t n = this->m_mat.rows();
         this->m_mat.resize(n, n);
         this->m_mat.data().squeeze();
+        return *this;
     }
 };
 
-OpPtr makeCoarseSolver(const SparseMatrix& A, const std::string& kind)
+/// Nested dissection ordering of a symmetric matrix from the positions of
+/// its unknowns (3 per unknown): the unknowns are split at the median
+/// coordinate of the widest direction, the unknowns of the lower half with a
+/// neighbour in the upper half form the separator, and the halves are split
+/// recursively. Order: lower half, upper half, separator. Returns the new
+/// index of every unknown.
+std::vector<int> nestedDissection(const SparseMatrix& A, const std::vector<double>& xyz)
 {
+    const int n = (int)A.rows();
+    std::vector<int> order, side(n, 0), stamp(n, -1);
+    order.reserve(n);
+    int call = 0;
+    std::vector< std::vector<int> > stack(1);
+    stack[0].resize(n);
+    for (int i=0; i<n; ++i) stack[0][i] = i;
+    // A stack entry is a set to split, or (as a negative-size marker) a
+    // separator to append after the sets above it are ordered
+    std::vector<char> isSep(1, 0);
+    while (!stack.empty())
+    {
+        std::vector<int> nodes;
+        nodes.swap(stack.back());
+        const bool sep = isSep.back();
+        stack.pop_back();
+        isSep.pop_back();
+        if (sep || nodes.size() <= 64)
+        {
+            order.insert(order.end(), nodes.begin(), nodes.end());
+            continue;
+        }
+        double lo[3] = {1e300,1e300,1e300}, hi[3] = {-1e300,-1e300,-1e300};
+        for (size_t q=0; q<nodes.size(); ++q)
+            for (int d=0; d<3; ++d)
+            {
+                lo[d] = std::min(lo[d], xyz[3*nodes[q]+d]);
+                hi[d] = std::max(hi[d], xyz[3*nodes[q]+d]);
+            }
+        int dir = 0;
+        for (int d=1; d<3; ++d) if (hi[d]-lo[d] > hi[dir]-lo[dir]) dir = d;
+        std::vector<double> c(nodes.size());
+        for (size_t q=0; q<nodes.size(); ++q) c[q] = xyz[3*nodes[q]+dir];
+        std::nth_element(c.begin(), c.begin()+c.size()/2, c.end());
+        const double med = c[c.size()/2];
+        const int id = call++;
+        std::vector<int> lower, upper, separator;
+        for (size_t q=0; q<nodes.size(); ++q)
+        {
+            stamp[nodes[q]] = id;
+            side[nodes[q]] = xyz[3*nodes[q]+dir] < med ? 1 : 2;
+        }
+        for (size_t q=0; q<nodes.size(); ++q)
+        {
+            const int i = nodes[q];
+            if (side[i] == 2) { upper.push_back(i); continue; }
+            bool cut = false;
+            for (SparseMatrix::InnerIterator it(A, i); it && !cut; ++it)
+                cut = (stamp[it.row()] == id && side[it.row()] == 2);
+            (cut ? separator : lower).push_back(i);
+        }
+        if (lower.empty() || upper.empty())
+        {
+            order.insert(order.end(), nodes.begin(), nodes.end());
+            continue;
+        }
+        // Pushed in reverse: lower is ordered first, the separator last
+        stack.push_back(separator); isSep.push_back(1);
+        stack.push_back(upper);     isSep.push_back(0);
+        stack.push_back(lower);     isSep.push_back(0);
+    }
+    std::vector<int> newIndex(n);
+    for (int i=0; i<n; ++i) newIndex[order[i]] = i;
+    return newIndex;
+}
+
+/// Sparse LDL^T factorization of a symmetric positive definite matrix in a
+/// given ordering (new index of every unknown)
+class OrderedLdltOp : public Op
+{
+public:
+    OrderedLdltOp(const SparseMatrix& A, const std::vector<int>& newIndex) : m_new(newIndex), m_n(A.rows())
+    {
+        gsSparseEntries<real_t> se;
+        se.reserve(A.nonZeros());
+        for (index_t j=0; j<A.outerSize(); ++j)
+            for (SparseMatrix::InnerIterator it(A, j); it; ++it)
+                se.add(m_new[it.row()], m_new[it.col()], it.value());
+        gsEigen::SparseMatrix<real_t> B(m_n, m_n);
+        B.setFromTriplets(se.begin(), se.end());
+        m_solver.compute(B);
+        GISMO_ENSURE(m_solver.info() == gsEigen::Success, "Factorization of the coarse matrix failed.");
+    }
+    void apply(const Matrix& x, Matrix& y) const
+    {
+        Matrix b(m_n, x.cols()), z;
+        for (index_t i=0; i<m_n; ++i) b.row(m_new[i]) = x.row(i);
+        z = m_solver.solve(b);
+        y.resize(m_n, x.cols());
+        for (index_t i=0; i<m_n; ++i) y.row(i) = z.row(m_new[i]);
+    }
+    index_t rows() const { return m_n; }
+    index_t cols() const { return m_n; }
+    index_t factorNonZeros() const { return m_solver.matrixL().nestedExpression().nonZeros(); }
+private:
+    gsEigen::SimplicialLDLT<gsEigen::SparseMatrix<real_t>, gsEigen::Lower, gsEigen::NaturalOrdering<int> > m_solver;
+    std::vector<int> m_new;
+    index_t m_n;
+};
+
+OpPtr makeCoarseSolver(const SparseMatrix& A, const std::string& kind, const std::vector<double>& xyz)
+{
+    if (kind == "ldlt-nd")
+    {
+        GISMO_ENSURE((index_t)xyz.size() == 3*A.rows(), "--coarse-solver=ldlt-nd needs the positions of the primal dofs.");
+        return memory::make_shared(new OrderedLdltOp(A, nestedDissection(A, xyz)));
+    }
     if (kind == "ldlt")
         return memory::make_shared(new SparseDirectOp< gsEigen::SimplicialLDLT<
             gsEigen::SparseMatrix<real_t>, gsEigen::Lower, gsEigen::AMDOrdering<int> > >(A));
-    GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu or ldlt).");
+    GISMO_ENSURE(kind == "lu", "Unknown coarse solver " << kind << " (lu, ldlt or ldlt-nd).");
     return memory::make_shared(new SparseDirectOp<LeanSparseLU>(A));
 }
 
@@ -2311,6 +2433,215 @@ struct CoarsePattern
     }
 };
 
+/// Physical position of each primal dof of global patch k: the mean of the
+/// images of the Greville points of the dofs in the support of its
+/// constraint, weighted by the absolute constraint coefficients
+std::vector<double> primalPositions(const Problem& P, index_t k, const std::vector<SparseVector>& constraints)
+{
+    const index_t l = P.loc(k);
+    gsMatrix<> anc = P.mb[l].anchors(), x;
+    P.mp[l].eval_into(anc, x);
+    std::vector<index_t> basisOf;
+    for (index_t r=0; r<P.dim; ++r)
+    {
+        const gsDofMapper& dl = P.mapper[r].dofMapperLocal(l);
+        std::vector<index_t> b(dl.freeSize());
+        for (index_t i=0; i<(index_t)dl.totalSize(); ++i)
+            if (dl.is_free(i,0)) b[dl.index(i,0)] = i;
+        basisOf.insert(basisOf.end(), b.begin(), b.end());
+    }
+    std::vector<double> out(3*constraints.size(), 0.0);
+    for (size_t j=0; j<constraints.size(); ++j)
+    {
+        double w = 0;
+        for (SparseVector::InnerIterator it(constraints[j]); it; ++it)
+        {
+            const double a = std::abs(it.value());
+            for (index_t d=0; d<x.rows() && d<3; ++d) out[3*j+d] += a * x(d, basisOf[it.row()]);
+            w += a;
+        }
+        if (w > 0) for (int d=0; d<3; ++d) out[3*j+d] /= w;
+    }
+    return out;
+}
+
+/// Coarse problem shared by all ranks (--coarse-on=distributed). A rank
+/// holds the primal dofs of its own patches; vectors are consistent (every
+/// holder carries the full value) and the contributions of the other holders
+/// are added with one neighbourhood exchange. The matrix is kept as the
+/// dense blocks Psi^T A Psi of the own patches, and the solve is a conjugate
+/// gradient iteration preconditioned with the inverse of the assembled
+/// diagonal, to a relative residual of tol. No rank holds data of the size
+/// of the coarse problem.
+struct CoarseDist
+{
+    std::vector<index_t> glob;               ///< global primal index of each local entry, ascending
+    std::vector< std::vector<index_t> > idx; ///< per own patch: local entry of each of its primal dofs
+    std::vector<Matrix> blocks;              ///< per own patch: Psi^T A Psi
+    Matrix weight, invDiag;
+    std::vector<int> nbr, cnt, dsp, sidx;    ///< adjacent ranks; shared entries per adjacent rank
+    mutable std::vector<double> sbuf, rbuf;
+    real_t tol;
+    index_t maxIt;
+    mutable index_t solves, iterations, maxIterations;
+#ifdef GISMO_WITH_MPI
+    MPI_Comm graph;
+#endif
+
+    CoarseDist() : tol(1e-14), maxIt(5000), solves(0), iterations(0), maxIterations(0)
+#ifdef GISMO_WITH_MPI
+    , graph(MPI_COMM_NULL)
+#endif
+    {}
+
+    index_t size() const { return (index_t)glob.size(); }
+
+    index_t local(index_t g) const
+    {
+        const std::vector<index_t>::const_iterator it = std::lower_bound(glob.begin(), glob.end(), g);
+        GISMO_ENSURE(it != glob.end() && *it == g, "Primal dof " << g << " is not held by this rank.");
+        return (index_t)(it - glob.begin());
+    }
+
+    /// Adds the contributions of the adjacent ranks to the shared entries
+    void exchange(Par& par, Matrix& y) const
+    {
+        GISMO_UNUSED(par); GISMO_UNUSED(y);
+#ifdef GISMO_WITH_MPI
+        if (nbr.empty()) return;
+        for (size_t i=0; i<sidx.size(); ++i) sbuf[i] = y(sidx[i],0);
+        MPI_Neighbor_alltoallv(sbuf.data(), cnt.data(), dsp.data(), MPI_DOUBLE,
+                               rbuf.data(), cnt.data(), dsp.data(), MPI_DOUBLE, graph);
+        for (size_t i=0; i<sidx.size(); ++i) y(sidx[i],0) += rbuf[i];
+#endif
+    }
+
+    real_t dot(Par& par, const Matrix& a, const Matrix& b) const
+    {
+        real_t s = 0;
+        for (index_t i=0; i<size(); ++i) s += weight(i,0)*a(i,0)*b(i,0);
+        return par.sumOf(s);
+    }
+
+    /// y = A x for a consistent x
+    void apply(Par& par, const Matrix& x, Matrix& y) const
+    {
+        y.setZero(size(), 1);
+        for (size_t q=0; q<blocks.size(); ++q)
+        {
+            const std::vector<index_t>& id = idx[q];
+            const Matrix& Bq = blocks[q];
+            const index_t m = id.size();
+            for (index_t b=0; b<m; ++b)
+            {
+                const real_t xb = x(id[b],0);
+                for (index_t a=0; a<m; ++a) y(id[a],0) += Bq(a,b) * xb;
+            }
+        }
+        exchange(par, y);
+    }
+
+    /// Layout, neighbourhood and diagonal from the primal dofs (pdof) and the
+    /// coarse blocks of the own patches; candidates are the ranks that own a
+    /// patch next to an own patch
+    void setup(Par& par, const std::vector< std::vector<index_t> >& pdof, std::vector<Matrix>& B,
+               const std::vector<int>& candidates)
+    {
+        glob.clear();
+        for (size_t q=0; q<pdof.size(); ++q) glob.insert(glob.end(), pdof[q].begin(), pdof[q].end());
+        std::sort(glob.begin(), glob.end());
+        glob.erase(std::unique(glob.begin(), glob.end()), glob.end());
+        idx.assign(pdof.size(), std::vector<index_t>());
+        for (size_t q=0; q<pdof.size(); ++q)
+            for (size_t a=0; a<pdof[q].size(); ++a) idx[q].push_back(local(pdof[q][a]));
+        blocks.swap(B);
+        weight.setOnes(size(), 1);
+        nbr.clear(); cnt.clear(); dsp.clear(); sidx.clear();
+#ifdef GISMO_WITH_MPI
+        if (par.size > 1)
+        {
+            nbr = par.symmetricNeighbours(candidates);
+            graph = par.neighbourGraph(nbr);
+            const int deg = (int)nbr.size();
+            std::vector<int> scnt(std::max(deg,1), (int)glob.size()), sdsp(std::max(deg,1), 0),
+                             rcnt(std::max(deg,1), 0), rdsp(std::max(deg,1), 0);
+            MPI_Neighbor_alltoall(scnt.data(), 1, MPI_INT, rcnt.data(), 1, MPI_INT, graph);
+            int tot = 0;
+            for (int j=0; j<deg; ++j) { rdsp[j] = tot; tot += rcnt[j]; }
+            std::vector<long long> mineIds(glob.begin(), glob.end()), sendIds, recvIds(std::max(tot,1));
+            for (int j=0; j<deg; ++j) { sdsp[j] = (int)sendIds.size(); sendIds.insert(sendIds.end(), mineIds.begin(), mineIds.end()); }
+            sendIds.resize(std::max<size_t>(sendIds.size(), 1));
+            MPI_Neighbor_alltoallv(sendIds.data(), scnt.data(), sdsp.data(), MPI_LONG_LONG,
+                                   recvIds.data(), rcnt.data(), rdsp.data(), MPI_LONG_LONG, graph);
+            cnt.assign(std::max(deg,1), 0);
+            dsp.assign(std::max(deg,1), 0);
+            for (int j=0; j<deg; ++j)
+            {
+                std::vector<long long> shared;
+                std::set_intersection(mineIds.begin(), mineIds.end(), recvIds.begin()+rdsp[j],
+                                      recvIds.begin()+rdsp[j]+rcnt[j], std::back_inserter(shared));
+                dsp[j] = (int)sidx.size();
+                cnt[j] = (int)shared.size();
+                for (size_t a=0; a<shared.size(); ++a)
+                {
+                    const index_t l = local((index_t)shared[a]);
+                    sidx.push_back((int)l);
+                    if (nbr[j] < par.rank) weight(l,0) = 0;
+                }
+            }
+            sbuf.assign(std::max<size_t>(sidx.size(), 1), 0.0);
+            rbuf.assign(std::max<size_t>(sidx.size(), 1), 0.0);
+        }
+#else
+        GISMO_UNUSED(candidates);
+#endif
+        Matrix d;
+        d.setZero(size(), 1);
+        for (size_t q=0; q<blocks.size(); ++q)
+            for (size_t a=0; a<idx[q].size(); ++a) d(idx[q][a],0) += blocks[q](a,a);
+        exchange(par, d);
+        invDiag.resize(size(), 1);
+        for (index_t i=0; i<size(); ++i)
+        {
+            GISMO_ENSURE(d(i,0) > 0, "Coarse matrix has a non-positive diagonal entry.");
+            invDiag(i,0) = 1.0 / d(i,0);
+        }
+    }
+
+    /// x = A^{-1} b for a consistent b, to the relative residual tol
+    void solve(Par& par, const Matrix& b, Matrix& x) const
+    {
+        x.setZero(size(), 1);
+        const real_t bnorm = math::sqrt(dot(par, b, b));
+        solves += 1;
+        if (bnorm == 0) return;
+        Matrix r = b, z = invDiag.cwiseProduct(r), p = z, Ap, s(2,1);
+        real_t rz = dot(par, r, z);
+        index_t it = 0;
+        for (; it<maxIt; ++it)
+        {
+            apply(par, p, Ap);
+            const real_t alpha = rz / dot(par, p, Ap);
+            x += alpha * p;
+            r -= alpha * Ap;
+            z = invDiag.cwiseProduct(r);
+            // r.r for the stopping test and r.z for the next direction in one reduction
+            s.setZero();
+            for (index_t i=0; i<size(); ++i)
+            {
+                s(0,0) += weight(i,0)*r(i,0)*r(i,0);
+                s(1,0) += weight(i,0)*r(i,0)*z(i,0);
+            }
+            par.sum(s);
+            if (math::sqrt(s(0,0)) <= tol * bnorm) { ++it; break; }
+            p = z + (s(1,0)/rz) * p;
+            rz = s(1,0);
+        }
+        iterations += it;
+        maxIterations = std::max(maxIterations, it);
+    }
+};
+
 struct OwnedPatch
 {
     index_t k, n;
@@ -2318,6 +2649,10 @@ struct OwnedPatch
     SparseMatrix     E;        ///< embedding of the local unknowns into the saddle point system
     Matrix           Psi;      ///< local primal basis, n x m
     std::vector<index_t> pdof; ///< global primal index of each column of Psi
+    std::vector<double>  pxyz; ///< position of each primal dof (--coarse-solver=ldlt-nd)
+    std::vector<index_t> cidx; ///< entry of each primal dof in the coarse vectors of this rank
+    Matrix           Ac;       ///< coarse block Psi^T A Psi (--coarse-on=distributed)
+    Matrix           fl;       ///< coarse right-hand side Psi^T f
     Matrix           f;        ///< right-hand side
     OpPtr            solver;   ///< solver for the local saddle point system
 };
@@ -2326,7 +2661,15 @@ class IetiMpi
 {
 public:
     IetiMpi(const Problem& P, Par& par, const Options& o, std::vector<index_t> mine, const Dual& dual)
-    : m_P(P), m_par(par), m_opt(o), m_mine(give(mine)), m_dual(dual), m_stats(new InnerStats), m_schurOp(*this), m_precOp(*this) {}
+    : m_P(P), m_par(par), m_opt(o), m_mine(give(mine)), m_dual(dual), m_stats(new InnerStats), m_schurOp(*this), m_precOp(*this),
+      m_tCsolve(0), m_tCcomm(0), m_nCsolve(0), m_coarseNnz(0),
+      m_coarseDist(o.coarseOn == "distributed"), m_nC(0) {}
+
+    /// Ranks that own a patch next to an own patch (--coarse-on=distributed)
+    void setCoarseCandidates(const std::vector<int>& c) { m_coarseCandidates = c; }
+    /// Conjugate gradient iterations of the distributed coarse solves: total and maximum
+    void coarseIterations(index_t& total, index_t& maximum) const
+    { total = m_cdist.iterations; maximum = m_cdist.maxIterations; }
 
     void setup(Timers& t, Memory& m);
 
@@ -2375,6 +2718,20 @@ public:
 
     const InnerStats& stats() const { return *m_stats; }
 
+    /// Seconds in the coarse solves and in their reduction and broadcast,
+    /// number of coarse solves, since the last reset
+    void coarseTimes(double& solve, double& comm, index_t& n) const
+    { solve = m_tCsolve; comm = m_tCcomm; n = m_nCsolve; }
+    void resetCoarseTimes() { m_tCsolve = m_tCcomm = 0; m_nCsolve = 0; }
+    /// Nonzeros of the coarse matrix (where it is factorized, else 0)
+    index_t coarseNonZeros() const { return m_coarseNnz; }
+    /// Nonzeros of the factor L of --coarse-solver=ldlt-nd (where it is factorized, else -1)
+    index_t coarseFactorNonZeros() const
+    {
+        const OrderedLdltOp* op = dynamic_cast<const OrderedLdltOp*>(m_coarse.get());
+        return op ? op->factorNonZeros() : -1;
+    }
+
 private:
     void applySchur(const Matrix& x, Matrix& y) const;
     void applyPrec(const Matrix& x, Matrix& y) const;
@@ -2384,26 +2741,47 @@ private:
     {
         Matrix out;
         if (m_P.nPrimal == 0) return out;
+        m_nCsolve += 1;
+        double t = wallTime();
+        if (m_coarseDist)
+        {
+            m_cdist.solve(m_par, g, out);
+            m_tCsolve += wallTime() - t;
+            return out;
+        }
         if (!m_opt.coarseRoot)
         {
             m_coarse->apply(g, out);
+            m_tCsolve += wallTime() - t;
             return out;
         }
         if (m_par.rank == 0)
             m_coarse->apply(g, out);
         else
             out.resize(m_P.nPrimal, 1);
+        m_tCsolve += wallTime() - t;
+        t = wallTime();
         m_par.bcast(out);
+        m_tCcomm += wallTime() - t;
         return out;
     }
     /// Sum of the primal contributions over the ranks, where coarseSolve needs it
     void sumPrimal(Matrix& g) const
     {
-        if (m_opt.coarseRoot) m_par.sumToRoot(g);
+        const double t = wallTime();
+        sumPrimalImpl(g);
+        m_tCcomm += wallTime() - t;
+    }
+    void sumPrimalImpl(Matrix& g) const
+    {
+        if (m_coarseDist)     m_cdist.exchange(m_par, g);
+        else if (m_opt.coarseRoot) m_par.sumToRoot(g);
         else                  m_par.sum(g);
     }
     void setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj,
                      const std::vector<double>& tv, Timers& t);
+    /// Positions of all primal dofs (3 per dof), on the ranks that factorize
+    std::vector<double> coarsePositions(bool rootOnly) const;
     void setupCoarseRoot(const std::vector<int>& lists, const std::vector<double>& values,
                          SparseMatrix& Ac) const;
 
@@ -2421,6 +2799,13 @@ private:
     memory::shared_ptr<InnerStats> m_stats;
     Schur               m_schurOp;
     Prec                m_precOp;
+    mutable double      m_tCsolve, m_tCcomm;  ///< seconds in the coarse solves and in their reduction and broadcast
+    mutable index_t     m_nCsolve;            ///< coarse solves
+    index_t             m_coarseNnz;
+    bool                m_coarseDist;         ///< --coarse-on=distributed
+    CoarseDist          m_cdist;
+    std::vector<int>    m_coarseCandidates;   ///< ranks that own a patch next to an own patch
+    index_t             m_nC;                 ///< size of the coarse vectors of this rank
     friend class Schur;
     friend class Prec;
 };
@@ -2431,7 +2816,7 @@ void IetiMpi::setup(Timers& t, Memory& mem)
     std::vector<int>    ti, tj;
     std::vector<double> tv;
     Matrix fc;
-    fc.setZero(nPrimal, 1);
+    if (!m_coarseDist) fc.setZero(nPrimal, 1);
 
     m_patches.clear();
     m_patches.reserve(m_mine.size());
@@ -2490,6 +2875,8 @@ void IetiMpi::setup(Timers& t, Memory& mem)
 
         const index_t m = raw.primalIdx.size();
         p.pdof = raw.primalIdx;
+        if (m_opt.coarseSolver == "ldlt-nd")
+            p.pxyz = primalPositions(m_P, k, raw.constraints);
         p.Psi.setZero(p.n, m);
         if (inexact)
         {
@@ -2565,16 +2952,20 @@ void IetiMpi::setup(Timers& t, Memory& mem)
             Matrix APsi = raw.A * p.Psi;
             Matrix Ac = p.Psi.transpose() * APsi;
             Matrix fl = p.Psi.transpose() * raw.f;
-            for (index_t a=0; a<m; ++a)
-            {
-                fc(p.pdof[a],0) += fl(a,0);
-                for (index_t b=0; b<m; ++b)
+            p.fl = fl;
+            if (m_coarseDist)
+                p.Ac = Ac;
+            else
+                for (index_t a=0; a<m; ++a)
                 {
-                    ti.push_back((int)p.pdof[a]);
-                    tj.push_back((int)p.pdof[b]);
-                    tv.push_back(Ac(a,b));
+                    fc(p.pdof[a],0) += fl(a,0);
+                    for (index_t b=0; b<m; ++b)
+                    {
+                        ti.push_back((int)p.pdof[a]);
+                        tj.push_back((int)p.pdof[b]);
+                        tv.push_back(Ac(a,b));
+                    }
                 }
-            }
         }
         p.B = give(raw.B);
         m_patches.push_back(give(p));
@@ -2590,10 +2981,38 @@ void IetiMpi::setup(Timers& t, Memory& mem)
 
     // Coarse problem
     t0 = wallTime();
-    if (nPrimal > 0)
+    if (m_coarseDist)
     {
-        setupCoarse(ti, tj, tv, t);
-        m_par.sum(fc);
+        std::vector< std::vector<index_t> > pdof;
+        std::vector<Matrix> blocks;
+        for (size_t q=0; q<m_patches.size(); ++q)
+        {
+            pdof.push_back(m_patches[q].pdof);
+            blocks.push_back(Matrix());
+            blocks.back().swap(m_patches[q].Ac);
+        }
+        m_cdist.tol = m_opt.coarseTol;
+        m_cdist.maxIt = m_opt.coarseMaxIt;
+        m_cdist.setup(m_par, pdof, blocks, m_coarseCandidates);
+        m_nC = m_cdist.size();
+        for (size_t q=0; q<m_patches.size(); ++q)
+            m_patches[q].cidx = m_cdist.idx[q];
+        fc.setZero(m_nC, 1);
+        for (size_t q=0; q<m_patches.size(); ++q)
+            for (size_t a=0; a<m_patches[q].cidx.size(); ++a)
+                fc(m_patches[q].cidx[a],0) += m_patches[q].fl(a,0);
+        m_cdist.exchange(m_par, fc);
+    }
+    else
+    {
+        m_nC = nPrimal;
+        for (size_t q=0; q<m_patches.size(); ++q)
+            m_patches[q].cidx = m_patches[q].pdof;
+        if (nPrimal > 0)
+        {
+            setupCoarse(ti, tj, tv, t);
+            m_par.sum(fc);
+        }
     }
     m_fc = fc;
     t.coarse += wallTime() - t0;
@@ -2620,7 +3039,7 @@ void IetiMpi::setup(Timers& t, Memory& mem)
         {
             const OwnedPatch& p = m_patches[i];
             Matrix yl(p.pdof.size(), 1);
-            for (size_t a=0; a<p.pdof.size(); ++a) yl(a,0) = yf(p.pdof[a],0);
+            for (size_t a=0; a<p.pdof.size(); ++a) yl(a,0) = yf(p.cidx[a],0);
             d += p.B * (p.Psi * yl);
         }
     }
@@ -2671,8 +3090,11 @@ void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj
             Ac.makeCompressed();
             t.cassemble += wallTime() - t0;
             t0 = wallTime();
+            m_coarseNnz = haveMatrix ? Ac.nonZeros() : 0;
+            const std::vector<double> xyz = m_opt.coarseSolver == "ldlt-nd"
+                ? coarsePositions(true) : std::vector<double>();
             if (haveMatrix)
-                m_coarse = makeCoarseSolver(Ac, m_opt.coarseSolver);
+                m_coarse = makeCoarseSolver(Ac, m_opt.coarseSolver, xyz);
             t.cfactor += wallTime() - t0;
             return;
         }
@@ -2696,14 +3118,43 @@ void IetiMpi::setupCoarse(const std::vector<int>& ti, const std::vector<int>& tj
     t.cassemble += wallTime() - t0;
 
     t0 = wallTime();
+    m_coarseNnz = haveMatrix ? Ac.nonZeros() : 0;
+    const std::vector<double> xyz = m_opt.coarseSolver == "ldlt-nd"
+        ? coarsePositions(m_opt.coarseRoot) : std::vector<double>();
     if (haveMatrix)
-        m_coarse = makeCoarseSolver(Ac, m_opt.coarseSolver);
+        m_coarse = makeCoarseSolver(Ac, m_opt.coarseSolver, xyz);
     t.cfactor += wallTime() - t0;
 }
 
 /// Coarse matrix on rank 0 from the primal indices (lists) and the dense
 /// blocks (values, row by row per patch) of all ranks; the blocks of rank q
 /// are received after those of rank q-1
+std::vector<double> IetiMpi::coarsePositions(bool rootOnly) const
+{
+    std::vector<int> idx;
+    std::vector<double> pos;
+    for (size_t q=0; q<m_patches.size(); ++q)
+    {
+        idx.insert(idx.end(), m_patches[q].pdof.begin(), m_patches[q].pdof.end());
+        pos.insert(pos.end(), m_patches[q].pxyz.begin(), m_patches[q].pxyz.end());
+    }
+    GISMO_ENSURE(pos.size() == 3*idx.size(), "Primal positions are missing.");
+    const std::vector<int>    ai = rootOnly ? m_par.gatherToRoot(idx) : m_par.gather(idx);
+    const std::vector<double> ap = rootOnly ? m_par.gatherToRoot(pos) : m_par.gather(pos);
+    std::vector<double> xyz;
+    if (rootOnly && m_par.rank != 0) return xyz;
+    xyz.assign(3*m_P.nPrimal, 0.0);
+    std::vector<int> cnt(m_P.nPrimal, 0);
+    for (size_t i=0; i<ai.size(); ++i)
+    {
+        for (int d=0; d<3; ++d) xyz[3*ai[i]+d] += ap[3*i+d];
+        ++cnt[ai[i]];
+    }
+    for (index_t i=0; i<m_P.nPrimal; ++i)
+        if (cnt[i] > 0) for (int d=0; d<3; ++d) xyz[3*i+d] /= cnt[i];
+    return xyz;
+}
+
 void IetiMpi::setupCoarseRoot(const std::vector<int>& lists, const std::vector<double>& values,
                               SparseMatrix& Ac) const
 {
@@ -2763,7 +3214,7 @@ void IetiMpi::applySchur(const Matrix& xin, Matrix& y) const
     const Matrix& x = m_dual.restrict(xin, tmp);
     yl.setZero(m_dual.nRows(), 1);
     Matrix g;
-    g.setZero(nPrimal, 1);
+    g.setZero(m_nC, 1);
 
     for (size_t i=0; i<m_patches.size(); ++i)
     {
@@ -2775,7 +3226,7 @@ void IetiMpi::applySchur(const Matrix& xin, Matrix& y) const
         if (nPrimal > 0)
         {
             Matrix gl = p.Psi.transpose() * w;
-            for (size_t a=0; a<p.pdof.size(); ++a) g(p.pdof[a],0) += gl(a,0);
+            for (size_t a=0; a<p.pdof.size(); ++a) g(p.cidx[a],0) += gl(a,0);
         }
     }
     if (nPrimal > 0)
@@ -2786,7 +3237,7 @@ void IetiMpi::applySchur(const Matrix& xin, Matrix& y) const
         {
             const OwnedPatch& p = m_patches[i];
             Matrix yc_l(p.pdof.size(), 1);
-            for (size_t a=0; a<p.pdof.size(); ++a) yc_l(a,0) = yc(p.pdof[a],0);
+            for (size_t a=0; a<p.pdof.size(); ++a) yc_l(a,0) = yc(p.cidx[a],0);
             yl += p.B * (p.Psi * yc_l);
         }
     }
@@ -2806,13 +3257,13 @@ std::vector<Matrix> IetiMpi::reconstruct(const Matrix& lambdaIn) const
     const Matrix& lambda = m_dual.restrict(lambdaIn, tmp);
     const index_t nPrimal = m_P.nPrimal;
     Matrix g;
-    g.setZero(nPrimal, 1);
+    g.setZero(m_nC, 1);
     for (size_t i=0; i<m_patches.size(); ++i)
     {
         const OwnedPatch& p = m_patches[i];
         Matrix w = p.B.transpose() * lambda;
         Matrix gl = p.Psi.transpose() * w;
-        for (size_t a=0; a<p.pdof.size(); ++a) g(p.pdof[a],0) += gl(a,0);
+        for (size_t a=0; a<p.pdof.size(); ++a) g(p.cidx[a],0) += gl(a,0);
     }
     Matrix yc;
     if (nPrimal > 0)
@@ -2830,7 +3281,7 @@ std::vector<Matrix> IetiMpi::reconstruct(const Matrix& lambdaIn) const
         if (nPrimal > 0)
         {
             Matrix yl(p.pdof.size(), 1);
-            for (size_t a=0; a<p.pdof.size(); ++a) yl(a,0) = yc(p.pdof[a],0);
+            for (size_t a=0; a<p.pdof.size(); ++a) yl(a,0) = yc(p.cidx[a],0);
             u[i] += p.Psi * yl;
         }
     }
@@ -2980,6 +3431,7 @@ int main(int argc, char* argv[])
     o.cost = "n2"; o.lcMethod = 1;
     o.setupOnly = false; o.emulateRanks = 0;
     o.coarse = "reduce"; o.coarseSolver = "lu"; o.coarseOn = "root";
+    o.coarseTol = 1e-14; o.coarseMaxIt = 5000;
     o.multipliers = "replicated";
 #ifdef IETI_WITH_LINKCELL
     o.dualNeighbours = "linkcell";
@@ -3016,14 +3468,17 @@ int main(int argc, char* argv[])
     cmd.addSwitch("",  "setup-only", "Stop after the coarse problem and print the timing split of the setup", o.setupOnly);
     cmd.addInt   ("",  "emulate-ranks", "With --setup-only on one rank: build the local patches of rank 0 of this many ranks (the counts of the other ranks for the global numbering are built one rank at a time) and stop after the mapper phase", o.emulateRanks);
     cmd.addString("",  "coarse",    "Assembly of the coarse matrix: gather (triplets on all ranks) or reduce (pattern from the primal indices; with --coarse-on=root the dense blocks are added on rank 0, with --coarse-on=all the values are summed with one reduction)", o.coarse);
-    cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD ordering) or ldlt (SimplicialLDLT, AMD ordering)", o.coarseSolver);
-    cmd.addString("",  "coarse-on", "Where the coarse matrix is factorized: root (rank 0, the coarse solutions are broadcast) or all (every rank)", o.coarseOn);
+    cmd.addString("",  "coarse-solver", "Coarse solver: lu (SparseLU, COLAMD ordering), ldlt (SimplicialLDLT, AMD ordering) or ldlt-nd (SimplicialLDLT, nested dissection from the positions of the primal dofs)", o.coarseSolver);
+    cmd.addString("",  "coarse-on", "Where the coarse problem is solved: root (factorized on rank 0, the coarse solutions are broadcast), all (factorized on every rank) or distributed (all ranks together, by conjugate gradients on the coarse blocks of their patches with a neighbourhood exchange)", o.coarseOn);
+    cmd.addReal  ("",  "coarse-tol", "Relative residual of the coarse solve of --coarse-on=distributed", o.coarseTol);
+    cmd.addInt   ("",  "coarse-maxit", "Maximum number of iterations of the coarse solve of --coarse-on=distributed", o.coarseMaxIt);
     cmd.addString("",  "multipliers", "Multiplier vector: replicated (every rank holds all multipliers, one reduction per operator application) or distributed (a rank holds the multipliers of its patches, one neighbourhood exchange per operator application)", o.multipliers);
     cmd.addString("",  "dual-neighbours", "Neighbour search of --multipliers=distributed: linkcell (halo cells and pair search over the own and the halo patches; needs GISMO_WITH_LINKCELL) or mapper (inverse of the dof mapper of the local patches)", o.dualNeighbours);
     try { cmd.getValues(argc, argv); } catch (int rv) { return rv; }
     GISMO_ENSURE(o.multipliers == "replicated" || o.multipliers == "distributed",
                  "--multipliers is replicated or distributed.");
-    GISMO_ENSURE(o.coarseOn == "root" || o.coarseOn == "all", "--coarse-on is root or all.");
+    GISMO_ENSURE(o.coarseOn == "root" || o.coarseOn == "all" || o.coarseOn == "distributed",
+                 "--coarse-on is root, all or distributed.");
     o.coarseRoot = (o.coarseOn == "root");
     if (o.traction.empty()) o.traction = (o.dim==3) ? "0,0,-1" : "0,-1";
 
@@ -3226,6 +3681,13 @@ int main(int argc, char* argv[])
     }
 
     IetiMpi ieti(P, par, o, mine, dual);
+    {
+        std::set<int> cand;
+        for (size_t q=0; q<mine.size(); ++q)
+            for (int j=P.nbrStart[mine[q]]; j<P.nbrStart[mine[q]+1]; ++j)
+                if (owner[P.nbr[j]] != par.rank) cand.insert(owner[P.nbr[j]]);
+        ieti.setCoarseCandidates(std::vector<int>(cand.begin(), cand.end()));
+    }
     ieti.setup(tm, mem);
     if (o.setupOnly)
     {
@@ -3240,6 +3702,7 @@ int main(int argc, char* argv[])
     bool converged = false;
     real_t cond = -1;
     par.commTime = 0; par.commCalls = 0; par.commBytes = 0;
+    ieti.resetCoarseTimes();
     t0 = wallTime();
     if (dual.distributed)
     {
@@ -3266,6 +3729,9 @@ int main(int argc, char* argv[])
     const double commSolve = par.commTime;
     const double commBytesSolve = par.commBytes;
     const index_t commCallsSolve = par.commCalls;
+    double tCsolve = 0, tCcomm = 0;
+    index_t nCsolve = 0;
+    ieti.coarseTimes(tCsolve, tCcomm, nCsolve);
 
     // True relative residual of the multiplier system
     Matrix Fl;
@@ -3421,6 +3887,10 @@ int main(int argc, char* argv[])
     const double dirCalls = par.sumOf(ieti.stats().dirCalls), dirIters = par.sumOf(ieti.stats().dirIters),
                  conCalls = par.sumOf(ieti.stats().conCalls), conIters = par.sumOf(ieti.stats().conIters);
     const std::string memFields = mem.fields(par);
+    const double tCsolveMax = par.maxOf(tCsolve), tCcommMax = par.maxOf(tCcomm);
+    index_t cgItTot = 0, cgItMax = 0;
+    ieti.coarseIterations(cgItTot, cgItMax);
+    const double memCoarseRoot = mem.coarse - mem.local;   // printed by rank 0
     int threads = 1;
 #ifdef _OPENMP
     threads = omp_get_max_threads();
@@ -3463,6 +3933,15 @@ int main(int argc, char* argv[])
            << " t_coarse=" << tCoarse
            << " t_cassemble=" << tMax.cassemble
            << " t_cfactor=" << tMax.cfactor
+           << " coarse_nnz=" << ieti.coarseNonZeros()
+           << " coarse_factor_nnz=" << ieti.coarseFactorNonZeros()
+           << " mem_coarse_root=" << memCoarseRoot
+           << " coarse_solves=" << nCsolve
+           << " t_csolve=" << tCsolveMax
+           << " t_ccomm=" << tCcommMax
+           << " coarse_on=" << o.coarseOn
+           << " coarse_cg_iters=" << cgItTot
+           << " coarse_cg_max=" << cgItMax
            << " coarse=" << o.coarse
            << " coarse_solver=" << o.coarseSolver
            << " coarse_root=" << (o.coarseRoot ? 1 : 0)
