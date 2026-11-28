@@ -805,13 +805,20 @@ struct lowRankElasticity
             w[m] = 2*deg[m]+1;
             W *= w[m];
         }
+        // Each block (e,c) accumulates its own terms, in their order; the
+        // blocks are independent of each other
         std::vector< std::vector<T> > band(d*d);
+        std::vector< std::vector<size_t> > termsOfBlock(d*d);
         for ( size_t i=0; i<terms.size(); ++i )
+            termsOfBlock[terms[i].e*d+terms[i].c].push_back(i);
+#pragma omp parallel for schedule(dynamic)
+        for ( index_t k=0; k<d*d; ++k )
         {
-            std::vector<T>& bd = band[terms[i].e*d+terms[i].c];
-            if (bd.empty())
-                bd.assign(n*W, (T)(0));
-            addToBand(terms[i], bd);
+            if (termsOfBlock[k].empty())
+                continue;
+            band[k].assign(n*W, (T)(0));
+            for ( size_t j=0; j<termsOfBlock[k].size(); ++j )
+                addToBand(terms[termsOfBlock[k][j]], band[k]);
         }
 
         std::vector< std::pair<index_t,index_t> > owner(N);
@@ -1050,8 +1057,13 @@ void setupLowRankElasticity(const gsBasis<T>& basis,
 
     std::vector< std::vector<T> > values(fs.size(), std::vector<T>(ntot));
     std::vector<T> norms(fs.size());
-    T maxNorm = 0;
-    for ( size_t f=0; f<fs.size(); ++f )
+    // The coefficient functions are independent of each other: sampled,
+    // compressed and turned into Kronecker factors in parallel, and the terms
+    // appended in their order afterwards, so the result does not depend on
+    // the number of threads.
+    const index_t nf = (index_t)fs.size();
+#pragma omp parallel for schedule(dynamic)
+    for ( index_t f=0; f<nf; ++f )
     {
         const coefIndex& ci = fs[f];
         std::vector<T>& v = values[f];
@@ -1078,19 +1090,23 @@ void setupLowRankElasticity(const gsBasis<T>& basis,
         for ( index_t q=0; q<ntot; ++q )
             s += v[q] * v[q];
         norms[f] = math::sqrt(s);
-        maxNorm = math::max(maxNorm, norms[f]);
     }
+    T maxNorm = 0;
+    for ( index_t f=0; f<nf; ++f )
+        maxNorm = math::max(maxNorm, norms[f]);
     std::vector<T>().swap(Jinv);
 
     const T abstol = tol * maxNorm;
     result.terms.clear();
-    std::vector< std::vector<T> > cores;
-    std::vector<index_t> ranks;
-    for ( size_t f=0; f<fs.size(); ++f )
+    std::vector< std::vector< lowRankTerm<T> > > termsOf(nf);
+#pragma omp parallel for schedule(dynamic)
+    for ( index_t f=0; f<nf; ++f )
     {
         if (norms[f] <= abstol)
             continue;
-        const bool nonzero = tensorTrainSvd(values[f], nq, abstol, cores, ranks, (index_t)f);
+        std::vector< std::vector<T> > cores;
+        std::vector<index_t> ranks;
+        const bool nonzero = tensorTrainSvd(values[f], nq, abstol, cores, ranks, f);
         std::vector<T>().swap(values[f]);
         if (!nonzero)
             continue;
@@ -1107,9 +1123,12 @@ void setupLowRankElasticity(const gsBasis<T>& basis,
                         cores[m].data() + a + ranks[m]*nq[m]*b, ranks[m],
                         m == ci.l, m == ci.k, result.sz[m]) );
         if (ci.e != ci.c || ci.k != ci.l)
-            result.terms.push_back(t.transposed());
-        result.terms.push_back(t);
+            termsOf[f].push_back(t.transposed());
+        termsOf[f].push_back(t);
     }
+    for ( index_t f=0; f<nf; ++f )
+        for ( size_t i=0; i<termsOf[f].size(); ++i )
+            result.terms.push_back(termsOf[f][i]);
 }
 
 } // anonymous namespace
