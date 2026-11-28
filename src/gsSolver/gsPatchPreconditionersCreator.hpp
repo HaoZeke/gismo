@@ -478,6 +478,12 @@ lowRankBanded<T> assembleLowRankFactor(const univariateQuadrature<T>& qu,
 // the sizes sz and the absolute tolerance tol. The core m is stored in
 // cores[m] with the entry (a,q,b) at a + ranks[m]*(q + sz[m]*b), where
 // ranks[0] = ranks[d] = 1. Returns false if the tensor is truncated to zero.
+//
+// Every unfolding X is reduced by a Householder QR to its small square
+// factor, whose SVD is computed by the one-sided Jacobi method: a wide X
+// from X^T = Q R and R^T = U S W^T, so X = U S (Q W)^T; a tall X from
+// X = Q R and R = W S V^T, so X = (Q W) S V^T. The Jacobi SVD is accurate
+// to working precision in every singular value and vector of the factor.
 template<typename T>
 bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
                     std::vector< std::vector<T> >& cores, std::vector<index_t>& ranks)
@@ -492,8 +498,6 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
     {
         const index_t rows = ranks[m] * sz[m], cols = total / sz[m];
         gsEigen::Map<Matrix> unfolding(x.data(), rows, cols);
-        // For a wide unfolding X, the SVD of X^T = Q R is computed from the
-        // SVD of the small factor R^T = U S W^T, so X = U S (Q W)^T
         const bool wide = rows < cols;
         gsEigen::HouseholderQR<Matrix> qr;
         Matrix U, V;
@@ -509,7 +513,9 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
         }
         else
         {
-            gsEigen::BDCSVD<Matrix> svd(unfolding, gsEigen::ComputeThinU | gsEigen::ComputeThinV);
+            qr.compute(unfolding);
+            const Matrix R = qr.matrixQR().topRows(cols).template triangularView<gsEigen::Upper>();
+            gsEigen::JacobiSVD<Matrix> svd(R, gsEigen::ComputeFullU | gsEigen::ComputeFullV);
             U = svd.matrixU();
             s = svd.singularValues();
             V = svd.matrixV();
@@ -530,6 +536,14 @@ bool tensorTrainSvd(std::vector<T>& x, const std::vector<index_t>& sz, T tol,
             QW.topRows(rows) = V.leftCols(r);
             QW.applyOnTheLeft(qr.householderQ());
             V.swap(QW);
+        }
+        else
+        {
+            // Only the kept columns of Q W are formed
+            Matrix QU = Matrix::Zero(rows, r);
+            QU.topRows(cols) = U.leftCols(r);
+            QU.applyOnTheLeft(qr.householderQ());
+            U.swap(QU);
         }
         cores[m].assign(U.data(), U.data() + rows*r);
         const Matrix rest = s.head(r).asDiagonal() * V.leftCols(r).transpose();
